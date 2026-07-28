@@ -1,6 +1,7 @@
 
 namespace LLM.Core.Model
 {
+    using System.Threading.Tasks;
     using LLM.Core.Tensor;
 
     /// <summary>
@@ -91,7 +92,9 @@ namespace LLM.Core.Model
     /// <summary>
     /// Causal multi-head self-attention (GPT-2 style): fused QKV projection, per-head
     /// scaled dot-product attention with causal mask, head concatenation, output
-    /// projection. Input/output are [T, DModel]; heads are processed with a simple loop.
+    /// projection. Input/output are [B*T, DModel]: B independent sequences of T rows
+    /// stacked row-wise (B = 1 is plain single-sequence inference). Attention never
+    /// crosses sequence boundaries; heads and sequences are processed with simple loops.
     /// </summary>
     public sealed class MultiHeadAttention
     {
@@ -99,9 +102,9 @@ namespace LLM.Core.Model
         private readonly int _nHeads, _headDim, _dModel;
         private readonly float _invScale;
 
-        // per-head forward caches
+        // per-(sequence, head) forward caches, laid out [batch * nHeads]
         private Tensor[]? _q, _k, _v, _probs;
-        private int _t;
+        private int _t, _batch = 1;
 
         public MultiHeadAttention(ITensorBackend backend, int nHeads, int dModel, Linear qkv, Linear proj)
         {
@@ -120,28 +123,41 @@ namespace LLM.Core.Model
         /// <summary>Output projection [DModel, DModel].</summary>
         public Linear Proj { get; }
 
-        /// <summary>Forward: x [T,D] -&gt; y [T,D]. Caches per-head Q, K, V and attention probs.</summary>
-        public Tensor Forward(Tensor x)
+        /// <summary>
+        /// Forward: x [B*T,D] -&gt; y [B*T,D]; every block of T consecutive rows is an
+        /// independent sequence. Caches per-(sequence, head) Q, K, V and attention probs.
+        /// </summary>
+        public Tensor Forward(Tensor x, int batch = 1)
         {
-            int t = x.Shape[0];
+            int rows = x.Shape[0];
+            if (batch < 1 || rows % batch != 0)
+                throw new ArgumentException($"Row count {rows} must be a multiple of batch size {batch}.");
+            int t = rows / batch;
             _t = t;
-            Tensor qkv = Qkv.Forward(x); // [T, 3D]
+            _batch = batch;
+            Tensor qkv = Qkv.Forward(x); // [B*T, 3D]
 
-            _q = new Tensor[_nHeads];
-            _k = new Tensor[_nHeads];
-            _v = new Tensor[_nHeads];
-            _probs = new Tensor[_nHeads];
-            var concat = new Tensor(t, _dModel);
+            int slots = batch * _nHeads;
+            _q = new Tensor[slots];
+            _k = new Tensor[slots];
+            _v = new Tensor[slots];
+            _probs = new Tensor[slots];
+            var concat = new Tensor(rows, _dModel);
 
-            for (int h = 0; h < _nHeads; h++)
+            // (sequence, head) slots are fully independent: parallelize over them.
+            // The small per-slot matmuls take the backend's sequential path, so
+            // there is no nested Parallel.For.
+            Parallel.For(0, slots, s =>
             {
+                int row0 = (s / _nHeads) * t;
+                int h = s % _nHeads;
                 int hd = _headDim;
                 var q = new Tensor(t, hd);
                 var k = new Tensor(t, hd);
                 var v = new Tensor(t, hd);
-                SliceHead(qkv, q, h * hd);
-                SliceHead(qkv, k, _dModel + h * hd);
-                SliceHead(qkv, v, 2 * _dModel + h * hd);
+                SliceHead(qkv, q, row0, h * hd);
+                SliceHead(qkv, k, row0, _dModel + h * hd);
+                SliceHead(qkv, v, row0, 2 * _dModel + h * hd);
 
                 var probs = new Tensor(t, t); // scores -> softmax in place
                 _b.MatMulNT(q.Data, k.Data, probs.Data, t, hd, t);
@@ -151,65 +167,67 @@ namespace LLM.Core.Model
 
                 var ctx = new Tensor(t, hd);
                 _b.MatMulNN(probs.Data, v.Data, ctx.Data, t, t, hd);
-                MergeHead(concat, ctx, h * hd);
+                MergeHead(concat, ctx, row0, h * hd);
 
-                _q[h] = q; _k[h] = k; _v[h] = v; _probs[h] = probs;
-            }
+                _q[s] = q; _k[s] = k; _v[s] = v; _probs[s] = probs;
+            });
 
             return Proj.Forward(concat);
         }
 
-        /// <summary>Backward: dY [T,D] -&gt; dX [T,D]; accumulates into Qkv/Proj parameter grads.</summary>
+        /// <summary>Backward: dY [B*T,D] -&gt; dX [B*T,D]; accumulates into Qkv/Proj parameter grads.</summary>
         public Tensor Backward(Tensor dY)
         {
             if (_q is null || _k is null || _v is null || _probs is null)
                 throw new InvalidOperationException("Forward must run before Backward.");
             int t = _t;
             int hd = _headDim;
-            Tensor dConcat = Proj.Backward(dY); // [T,D]
-            var dQkv = new Tensor(t, 3 * _dModel);
+            Tensor dConcat = Proj.Backward(dY); // [B*T,D]
+            var dQkv = new Tensor(dY.Shape[0], 3 * _dModel);
 
-            for (int h = 0; h < _nHeads; h++)
+            Parallel.For(0, _batch * _nHeads, s =>
             {
+                int row0 = (s / _nHeads) * t;
+                int h = s % _nHeads;
                 var dCtx = new Tensor(t, hd);
-                SliceHead(dConcat, dCtx, h * hd);
+                SliceHead(dConcat, dCtx, row0, h * hd);
 
                 var dProbs = new Tensor(t, t);
-                _b.MatMulNT(dCtx.Data, _v[h].Data, dProbs.Data, t, hd, t);
+                _b.MatMulNT(dCtx.Data, _v[s].Data, dProbs.Data, t, hd, t);
                 var dV = new Tensor(t, hd);
-                _b.MatMulTN(_probs[h].Data, dCtx.Data, dV.Data, t, t, hd);
+                _b.MatMulTN(_probs[s].Data, dCtx.Data, dV.Data, t, t, hd);
 
                 var dScores = new Tensor(t, t);
-                _b.SoftmaxBackward(dProbs.Data, _probs[h].Data, dScores.Data, t, t);
+                _b.SoftmaxBackward(dProbs.Data, _probs[s].Data, dScores.Data, t, t);
                 _b.Scale(dScores.Data, _invScale);
 
                 var dQ = new Tensor(t, hd);
-                _b.MatMulNN(dScores.Data, _k[h].Data, dQ.Data, t, t, hd);
+                _b.MatMulNN(dScores.Data, _k[s].Data, dQ.Data, t, t, hd);
                 var dK = new Tensor(t, hd);
-                _b.MatMulTN(dScores.Data, _q[h].Data, dK.Data, t, t, hd);
+                _b.MatMulTN(dScores.Data, _q[s].Data, dK.Data, t, t, hd);
 
-                MergeHead(dQkv, dQ, h * hd);
-                MergeHead(dQkv, dK, _dModel + h * hd);
-                MergeHead(dQkv, dV, 2 * _dModel + h * hd);
-            }
+                MergeHead(dQkv, dQ, row0, h * hd);
+                MergeHead(dQkv, dK, row0, _dModel + h * hd);
+                MergeHead(dQkv, dV, row0, 2 * _dModel + h * hd);
+            });
 
             return Qkv.Backward(dQkv);
         }
 
-        /// <summary>dst[t, 0..cols) = src[t, colOffset..colOffset+cols) — extract one head's columns.</summary>
-        private static void SliceHead(Tensor src, Tensor dst, int colOffset)
+        /// <summary>dst[t, 0..cols) = src[rowOffset+t, colOffset..colOffset+cols) — extract one head's columns of one sequence.</summary>
+        private static void SliceHead(Tensor src, Tensor dst, int rowOffset, int colOffset)
         {
             int t = dst.Shape[0], cols = dst.Shape[1], srcCols = src.Shape[1];
             for (int i = 0; i < t; i++)
-                Array.Copy(src.Data, i * srcCols + colOffset, dst.Data, i * cols, cols);
+                Array.Copy(src.Data, (rowOffset + i) * srcCols + colOffset, dst.Data, i * cols, cols);
         }
 
-        /// <summary>dst[t, colOffset..colOffset+cols) = src[t, 0..cols) — write one head's columns back.</summary>
-        private static void MergeHead(Tensor dst, Tensor src, int colOffset)
+        /// <summary>dst[rowOffset+t, colOffset..colOffset+cols) = src[t, 0..cols) — write one head's columns of one sequence back.</summary>
+        private static void MergeHead(Tensor dst, Tensor src, int rowOffset, int colOffset)
         {
             int t = src.Shape[0], cols = src.Shape[1], dstCols = dst.Shape[1];
             for (int i = 0; i < t; i++)
-                Array.Copy(src.Data, i * cols, dst.Data, i * dstCols + colOffset, cols);
+                Array.Copy(src.Data, i * cols, dst.Data, (rowOffset + i) * dstCols + colOffset, cols);
         }
     }
 
@@ -309,10 +327,10 @@ namespace LLM.Core.Model
         public LayerNorm Ln2 { get; }
         public Mlp Mlp { get; }
 
-        /// <summary>Forward: x [T,D] -&gt; y [T,D]. Caches the midpoint residual x2.</summary>
-        public Tensor Forward(Tensor x)
+        /// <summary>Forward: x [B*T,D] -&gt; y [B*T,D] (B independent sequences of T rows). Caches the midpoint residual x2.</summary>
+        public Tensor Forward(Tensor x, int batch = 1)
         {
-            Tensor a = Attn.Forward(Ln1.Forward(x));
+            Tensor a = Attn.Forward(Ln1.Forward(x), batch);
             _x2 = x.Clone();
             _b.AddInPlace(_x2.Data, a.Data);
             Tensor m = Mlp.Forward(Ln2.Forward(_x2));
@@ -321,7 +339,7 @@ namespace LLM.Core.Model
             return y;
         }
 
-        /// <summary>Backward: dY [T,D] -&gt; dX [T,D]; accumulates all sub-block parameter grads.</summary>
+        /// <summary>Backward: dY [B*T,D] -&gt; dX [B*T,D]; accumulates all sub-block parameter grads.</summary>
         public Tensor Backward(Tensor dY)
         {
             if (_x2 is null) throw new InvalidOperationException("Forward must run before Backward.");

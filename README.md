@@ -8,7 +8,7 @@ format) is implemented on top of the Base Class Library only.
 
 ```sh
 dotnet build
-dotnet run --project tests/LLM.Core.Tests   # 46 tests
+dotnet run --project tests/LLM.Core.Tests   # 54 tests
 ```
 
 ## Quickstart
@@ -37,11 +37,12 @@ a checkpoint with `--init`, etc.).
 - `prepare` accepts a local file or an http(s) URL (default: tiny-shakespeare),
   trains or loads a tokenizer (`tokenizer.json`), encodes the corpus, and writes
   a 90/10 split of raw little-endian uint16 token files (`train.bin`, `val.bin`).
-- `train` runs a single-sequence training loop with warmup + cosine LR decay,
-  gradient clipping, and periodic validation loss. Checkpoints are written at the
-  end, every `--saveevery N` steps, and on Ctrl+C (the run finishes its current
-  step, then saves) — an interrupted run is never lost. `--init` resumes from a
-  checkpoint.
+- `train` runs a batched training loop: each optimizer step processes `--batch N`
+  sequences (default 8) at once as `[B*T, C]` tensors, with warmup + cosine LR
+  decay, gradient clipping, and periodic validation loss. Checkpoints are written
+  at the end, every `--saveevery N` steps, and on Ctrl+C (the run finishes its
+  current step, then saves) — an interrupted run is never lost. `--init` resumes
+  from a checkpoint.
 - `generate` loads a checkpoint and samples autoregressively with temperature
   and top-k filtering.
 - `chat` is an interactive REPL over a checkpoint: each line you type is appended
@@ -54,15 +55,19 @@ a checkpoint with `--init`, etc.).
   rank-greedy; any byte sequence round-trips losslessly.
 - **GPT model** (`Model/`) — GPT-2 architecture: learned token + positional
   embeddings, pre-LN transformer blocks (multi-head causal self-attention +
-  GELU MLP), final LayerNorm, untied output head. Sequences are processed one
-  at a time as `[T, C]` tensors — no batching, no KV cache.
+  GELU MLP), final LayerNorm, untied output head. Training is batched: B
+  sequences of length T are stacked row-wise into `[B*T, C]` tensors and
+  processed in one pass (attention never crosses sequence boundaries).
+  Inference runs one sequence at a time; there is no KV cache.
 - **Training** (`Training/`) — AdamW (decoupled weight decay on 2-D params),
   linear-warmup + cosine-decay LR schedule, global gradient-norm clipping, and
   a random-offset data loader over raw uint16 token files.
 - **CPU backend** (`Tensor/CpuBackend.cs`) — all math through an
   `ITensorBackend` interface; the CPU implementation uses `Vector<T>` SIMD in
-  the matmul inner loops and `Parallel.For` over output rows, with pooled
-  buffers (no steady-state allocation).
+  the matmul inner loops. Large matmuls parallelize over output rows with
+  `Parallel.For` and pooled buffers (no steady-state allocation); small ones
+  (attention scores) run sequentially while batched attention parallelizes
+  across (sequence, head) slots instead.
 - **Checkpoints** (`Checkpoint/Checkpoint.cs`) — custom binary format:
   `LLMSCRATCH1` magic, a JSON header (model config + parameter names), then raw
   little-endian float32 weights. Loading validates everything and fails loud.

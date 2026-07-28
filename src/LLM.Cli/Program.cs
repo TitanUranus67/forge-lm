@@ -51,7 +51,7 @@ internal static class Cli
         Usage:
           llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
           llm train     --data <dir> [--steps 5000] [--dmodel 128] [--layers 4] [--heads 4]
-                        [--ctx 128] [--lr 6e-4] [--minlr 6e-5] [--warmup 100] [--wd 0.1]
+                        [--ctx 128] [--batch 8] [--lr 6e-4] [--minlr 6e-5] [--warmup 100] [--wd 0.1]
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
@@ -177,6 +177,7 @@ internal static class Cli
 
                   Trains a GPT on the tokenizer.json + train.bin/val.bin produced by
                   `prepare`, and writes a checkpoint to --out (default out/model.bin).
+                  Each optimizer step processes --batch sequences (default 8) at once.
                   --init resumes from an existing checkpoint (config comes from it;
                   the architecture flags are then ignored). --saveevery N writes the
                   checkpoint every N steps. Ctrl+C stops after the current step and
@@ -191,6 +192,7 @@ internal static class Cli
         int layers = p.GetInt("layers", 4);
         int heads = p.GetInt("heads", 4);
         int ctx = p.GetInt("ctx", 128);
+        int batch = p.GetInt("batch", 8);
         float lr = p.GetFloat("lr", 6e-4f);
         float minlr = p.GetFloat("minlr", 6e-5f);
         int warmup = p.GetInt("warmup", 100);
@@ -225,6 +227,8 @@ internal static class Cli
         var trainLoader = new DataLoader(Path.Combine(dataDir, "train.bin"));
         var valLoader = new DataLoader(Path.Combine(dataDir, "val.bin"));
         Console.WriteLine($"data: {trainLoader.Length:N0} train tokens, {valLoader.Length:N0} val tokens");
+        Console.WriteLine($"training: batch {batch} x {model.Config.ContextLength} ctx " +
+                          $"({batch * (double)model.Config.ContextLength:N0} tokens/step)");
 
         var opts = new TrainOptions
         {
@@ -234,6 +238,7 @@ internal static class Cli
             WarmupSteps = warmup,
             WeightDecay = wd,
             GradClip = gradclip,
+            BatchSize = batch,
             Seed = seed,
             LogEvery = logevery,
             ValEvery = valevery,
@@ -242,7 +247,7 @@ internal static class Cli
 
         void OnLog(TrainLog l)
         {
-            double tokSec = l.Step * (double)model.Config.ContextLength / Math.Max(l.Elapsed.TotalSeconds, 1e-9);
+            double tokSec = l.Step * (double)model.Config.ContextLength * batch / Math.Max(l.Elapsed.TotalSeconds, 1e-9);
             string val = l.ValLoss.HasValue ? $"  val {l.ValLoss.Value:F4}" : "";
             Console.WriteLine($"step {l.Step,6}/{steps}  lr {l.Lr:E2}  loss {l.TrainLoss:F4}{val}  " +
                               $"{tokSec:N0} tok/s  ({l.Elapsed:mm\\:ss})");

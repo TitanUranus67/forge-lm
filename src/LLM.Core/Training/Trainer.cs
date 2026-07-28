@@ -21,6 +21,8 @@ namespace LLM.Core.Training
         public float GradClip { get; init; } = 1.0f;
         /// <summary>Sequence length per step; 0 means the model's ContextLength.</summary>
         public int ContextLength { get; init; }
+        /// <summary>Sequences per optimizer step (true batching: one [B*T, C] pass per step).</summary>
+        public int BatchSize { get; init; } = 8;
         /// <summary>RNG seed for data sampling (and therefore reproducibility).</summary>
         public int Seed { get; init; } = 1337;
         /// <summary>Emit a log record every this many steps.</summary>
@@ -40,11 +42,11 @@ namespace LLM.Core.Training
     public sealed record TrainSummary(float FinalTrainLoss, float? FinalValLoss, int Steps, TimeSpan Elapsed);
 
     /// <summary>
-    /// Minimal single-sequence training loop. Each step samples ONE sequence of
-    /// ContextLength tokens (no batching, no gradient accumulation — the model
-    /// processes [T, C] tensors without a batch dimension), runs forward/backward,
-    /// clips the global gradient norm, and applies one AdamW update on the
-    /// warmup+cosine learning-rate schedule.
+    /// Batched training loop. Each step samples <see cref="TrainOptions.BatchSize"/>
+    /// sequences of ContextLength tokens, stacks them row-wise into one [B*T, C]
+    /// pass (loss and gradients are the mean over all B*T positions), clips the
+    /// global gradient norm, and applies one AdamW update on the warmup+cosine
+    /// learning-rate schedule.
     /// </summary>
     public static class Trainer
     {
@@ -65,10 +67,14 @@ namespace LLM.Core.Training
         {
             if (val is null && opts.ValEvery != 0)
                 throw new ArgumentException("ValEvery is set but no val DataLoader was given.", nameof(val));
+            if (opts.BatchSize < 1)
+                throw new ArgumentException("BatchSize must be >= 1.", nameof(opts));
             int ctx = opts.ContextLength > 0 ? opts.ContextLength : model.Config.ContextLength;
+            int batch = opts.BatchSize;
             var rng = new Random(opts.Seed);
             var adam = new AdamW();
-            int[] inputs = new int[ctx], targets = new int[ctx];
+            int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
+            int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
             var sw = Stopwatch.StartNew();
 
             float lastTrain = 0f, lastVal = float.NaN;
@@ -78,9 +84,14 @@ namespace LLM.Core.Training
                 if (cancel.IsCancellationRequested) break;
                 float lr = LrSchedule.GetLr(step, opts.Steps, opts.MaxLr, opts.MinLr, opts.WarmupSteps);
 
-                train.Sample(rng, ctx, inputs, targets);
+                for (int b = 0; b < batch; b++)
+                {
+                    train.Sample(rng, ctx, seqInputs, seqTargets);
+                    Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
+                    Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
+                }
                 model.Params.ZeroGrads();
-                lastTrain = model.ForwardBackward(inputs, targets);
+                lastTrain = model.ForwardBackward(inputs, targets, batch);
                 ClipGradNorm(model.Params, opts.GradClip);
                 adam.Step(model.Params, lr, weightDecay: opts.WeightDecay);
                 stepsRun = step + 1;
@@ -104,18 +115,20 @@ namespace LLM.Core.Training
             return new TrainSummary(lastTrain, float.IsNaN(lastVal) ? null : lastVal, stepsRun, sw.Elapsed);
         }
 
-        /// <summary>Mean loss of <paramref name="samples"/> random sequences; leaves grads dirty.</summary>
+        /// <summary>Mean loss of one batch of <paramref name="samples"/> random sequences; leaves grads dirty.</summary>
         private static float EvalLoss(GptModel model, DataLoader data, Random rng, int ctx, int samples)
         {
-            int[] inputs = new int[ctx], targets = new int[ctx];
-            float sum = 0f;
-            for (int i = 0; i < samples; i++)
+            int[] inputs = new int[samples * ctx], targets = new int[samples * ctx];
+            int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
+            for (int b = 0; b < samples; b++)
             {
-                data.Sample(rng, ctx, inputs, targets);
-                model.Params.ZeroGrads();
-                sum += model.ForwardBackward(inputs, targets);
+                data.Sample(rng, ctx, seqInputs, seqTargets);
+                Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
+                Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
             }
-            return sum / samples;
+            model.Params.ZeroGrads();
+            // mean over all samples*ctx positions == mean of per-sequence means (equal lengths)
+            return model.ForwardBackward(inputs, targets, samples);
         }
 
         /// <summary>Scales all gradients so the global L2 norm does not exceed maxNorm.</summary>

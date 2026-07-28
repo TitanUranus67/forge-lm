@@ -5,9 +5,11 @@ namespace LLM.Core.Model
 
     /// <summary>
     /// GPT language model (GPT-2 architecture, pre-LN, learned positional embeddings,
-    /// untied output head). Sequences are processed one at a time as [T, C] tensors —
-    /// no batch dimension, no KV cache. All parameter gradients accumulate into the
-    /// <see cref="Parameters"/> registry; the caller zeroes them.
+    /// untied output head). Training runs batched: B sequences of length T are stacked
+    /// row-wise into [B*T, C] tensors (sequence b occupies rows b*T..(b+1)*T) and
+    /// processed in one pass — attention never crosses sequence boundaries. Inference
+    /// uses the single-sequence path (B = 1); there is no KV cache. All parameter
+    /// gradients accumulate into the <see cref="Parameters"/> registry; the caller zeroes them.
     ///
     /// Parameter names:
     ///   tok_emb, pos_emb,
@@ -29,6 +31,10 @@ namespace LLM.Core.Model
         // caches for Backward
         private int[]? _lastTokens;
         private Tensor? _logits;
+
+        // cached positional indices for the batched path: [0..T) repeated B times
+        private int[]? _batchPositions;
+        private int _batchPosT = -1, _batchPosBatch = -1;
 
         public GptModel(ModelConfig config, ITensorBackend backend, Random rng)
         {
@@ -103,14 +109,7 @@ namespace LLM.Core.Model
         public Tensor Forward(IReadOnlyList<int> tokens)
         {
             int[] toks = ValidateTokens(tokens);
-            _lastTokens = toks;
-
-            Tensor x = _tokEmb.Forward(toks);
-            _b.AddInPlace(x.Data, _posEmb.Forward(_positions.AsSpan(0, toks.Length)).Data);
-            foreach (TransformerBlock block in _blocks)
-                x = block.Forward(x);
-            _logits = _head.Forward(_lnF.Forward(x));
-            return _logits;
+            return ForwardCore(toks, batch: 1);
         }
 
         /// <summary>
@@ -123,16 +122,33 @@ namespace LLM.Core.Model
         {
             if (inputs.Count != targets.Count)
                 throw new ArgumentException($"inputs ({inputs.Count}) and targets ({targets.Count}) must have equal length.");
-            Tensor logits = Forward(inputs);
-            int t = logits.Shape[0], v = Config.VocabSize;
-            int[] tgt = ValidateTargets(targets);
+            return ForwardBackwardCore(ValidateTokens(inputs), ValidateTargets(targets), batch: 1);
+        }
 
-            var probs = new Tensor(t, v);
-            float loss = _b.CrossEntropyForward(logits.Data, tgt, probs.Data, t, v, IgnoreIndex);
-            var dLogits = new Tensor(t, v);
-            _b.CrossEntropyBackward(probs.Data, tgt, dLogits.Data, t, v, IgnoreIndex);
-            Backward(dLogits);
-            return loss;
+        /// <summary>
+        /// Full training step on a batch of <paramref name="batch"/> equal-length
+        /// sequences, flattened sequence-major: sequence b occupies rows
+        /// b*T..(b+1)*T of <paramref name="inputs"/>/<paramref name="targets"/>
+        /// (T = inputs.Length / batch). One forward/backward over [B*T, C] tensors;
+        /// the loss and gradients are the mean over all B*T positions (which, all
+        /// sequences having equal length, equals the mean of per-sequence means).
+        /// Gradients are NOT zeroed here — call <see cref="Parameters.ZeroGrads"/> first.
+        /// Returns the loss.
+        /// </summary>
+        public float ForwardBackward(int[] inputs, int[] targets, int batch)
+        {
+            if (batch < 1)
+                throw new ArgumentOutOfRangeException(nameof(batch), "batch must be >= 1.");
+            if (inputs.Length != targets.Length)
+                throw new ArgumentException($"inputs ({inputs.Length}) and targets ({targets.Length}) must have equal length.");
+            if (inputs.Length % batch != 0)
+                throw new ArgumentException($"inputs length {inputs.Length} is not a multiple of batch {batch}.");
+            int t = inputs.Length / batch;
+            if (t == 0)
+                throw new ArgumentException("Need at least one token per sequence.");
+            if (t > Config.ContextLength)
+                throw new ArgumentException($"Sequence length {t} exceeds ContextLength {Config.ContextLength}.");
+            return ForwardBackwardCore(ValidateTokenIds(inputs), ValidateTargets(targets), batch);
         }
 
         /// <summary>
@@ -146,6 +162,49 @@ namespace LLM.Core.Model
             var last = new Tensor(1, v);
             Array.Copy(logits.Data, (t - 1) * v, last.Data, 0, v);
             return last;
+        }
+
+        /// <summary>Batched forward: tokens [B*T] (sequence-major) -&gt; logits [B*T, Vocab].</summary>
+        private Tensor ForwardCore(int[] tokens, int batch)
+        {
+            _lastTokens = tokens;
+            int t = tokens.Length / batch;
+
+            Tensor x = _tokEmb.Forward(tokens);
+            _b.AddInPlace(x.Data, _posEmb.Forward(BatchPositions(batch, t)).Data);
+            foreach (TransformerBlock block in _blocks)
+                x = block.Forward(x, batch);
+            _logits = _head.Forward(_lnF.Forward(x));
+            return _logits;
+        }
+
+        /// <summary>Batched training step: forward, mean cross-entropy over all B*T positions, backward.</summary>
+        private float ForwardBackwardCore(int[] inputs, int[] targets, int batch)
+        {
+            Tensor logits = ForwardCore(inputs, batch);
+            int rows = logits.Shape[0], v = Config.VocabSize;
+
+            var probs = new Tensor(rows, v);
+            float loss = _b.CrossEntropyForward(logits.Data, targets, probs.Data, rows, v, IgnoreIndex);
+            var dLogits = new Tensor(rows, v);
+            _b.CrossEntropyBackward(probs.Data, targets, dLogits.Data, rows, v, IgnoreIndex);
+            Backward(dLogits);
+            return loss;
+        }
+
+        /// <summary>Positional indices [0..T) repeated B times; rebuilt only when (B, T) changes.</summary>
+        private int[] BatchPositions(int batch, int t)
+        {
+            if (_batchPositions is null || _batchPosT != t || _batchPosBatch != batch)
+            {
+                var pos = new int[batch * t];
+                for (int b = 0; b < batch; b++)
+                    Array.Copy(_positions, 0, pos, b * t, t);
+                _batchPositions = pos;
+                _batchPosT = t;
+                _batchPosBatch = batch;
+            }
+            return _batchPositions;
         }
 
         /// <summary>Backpropagates dLogits through head, final LN, blocks and embeddings.</summary>
@@ -165,6 +224,12 @@ namespace LLM.Core.Model
             if (tokens.Count == 0) throw new ArgumentException("Need at least one token.");
             if (tokens.Count > Config.ContextLength)
                 throw new ArgumentException($"Sequence length {tokens.Count} exceeds ContextLength {Config.ContextLength}.");
+            return ValidateTokenIds(tokens);
+        }
+
+        /// <summary>Copies a flattened (possibly batched) token array, range-checking every id.</summary>
+        private int[] ValidateTokenIds(IReadOnlyList<int> tokens)
+        {
             var toks = new int[tokens.Count];
             for (int i = 0; i < toks.Length; i++)
             {

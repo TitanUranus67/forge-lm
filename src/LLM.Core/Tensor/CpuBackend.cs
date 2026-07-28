@@ -6,13 +6,16 @@ namespace LLM.Core.Tensor;
 
 /// <summary>
 /// Pure-managed CPU implementation of <see cref="ITensorBackend"/>.
-/// Matmuls parallelize over output rows with <see cref="Parallel.For"/> and use
-/// <see cref="Vector{T}"/> SIMD in the inner loops. Everything else is scalar
-/// Span-based code with no allocations in hot paths.
+/// Large matmuls parallelize over output rows with <see cref="Parallel.For"/> and use
+/// <see cref="Vector{T}"/> SIMD in the inner loops; small matmuls (attention scores etc.)
+/// run sequentially directly on the input spans — below the parallel threshold the
+/// pooled-copy + Parallel.For overhead costs more than the compute, and callers
+/// (e.g. batched attention) already parallelize over independent slots at a higher level.
+/// Everything else is scalar Span-based code with no allocations in hot paths.
 /// </summary>
 /// <remarks>
 /// Spans cannot be captured by the <see cref="Parallel.For"/> lambda (ref-like
-/// types in closures), so the matmul entry points copy their operands into
+/// types in closures), so the large-matmul entry points copy their operands into
 /// pooled arrays first. Rents come from <see cref="ArrayPool{T}.Shared"/>, so
 /// steady-state calls do not allocate; the copy is O(MK+KN+MN) against the
 /// O(M*N*K) compute it enables.
@@ -22,15 +25,95 @@ public sealed class CpuBackend : ITensorBackend
     private static readonly float GeluC = MathF.Sqrt(2f / MathF.PI); // sqrt(2/pi)
     private const float GeluCoeff = 0.044715f;
 
+    /// <summary>Matmuls with M*K*N at or below this run sequentially (no pooling, no Parallel.For).</summary>
+    private const long SmallMatMulWork = 8_000_000;
+
     // ---- Matmul ------------------------------------------------------------
 
     /// <inheritdoc/>
     public void MatMulNN(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate = false)
-        => MatMulRowKernel(a, b, y, M, K, N, accumulate, aIsTransposed: false);
+    {
+        if ((long)M * K * N <= SmallMatMulWork)
+        {
+            MatMulRowKernelSeq(a, b, y, M, K, N, accumulate, aIsTransposed: false);
+            return;
+        }
+        MatMulRowKernel(a, b, y, M, K, N, accumulate, aIsTransposed: false);
+    }
 
     /// <inheritdoc/>
     public void MatMulTN(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate = false)
-        => MatMulRowKernel(a, b, y, M, K, N, accumulate, aIsTransposed: true);
+    {
+        if ((long)M * K * N <= SmallMatMulWork)
+        {
+            MatMulRowKernelSeq(a, b, y, M, K, N, accumulate, aIsTransposed: true);
+            return;
+        }
+        MatMulRowKernel(a, b, y, M, K, N, accumulate, aIsTransposed: true);
+    }
+
+    /// <inheritdoc/>
+    public void MatMulNT(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate = false)
+    {
+        if ((long)M * K * N <= SmallMatMulWork)
+        {
+            // y[m,n] = dot(a[m,:], b[n,:]); both rows contiguous.
+            for (int m = 0; m < M; m++)
+            {
+                ReadOnlySpan<float> aRow = a.Slice(m * K, K);
+                Span<float> yRow = y.Slice(m * N, N);
+                for (int n = 0; n < N; n++)
+                {
+                    float d = Dot(aRow, b.Slice(n * K, K));
+                    if (accumulate) yRow[n] += d;
+                    else yRow[n] = d;
+                }
+            }
+            return;
+        }
+
+        // y[m,n] = dot(a[m,:], b[n,:]); both rows contiguous.
+        var pool = ArrayPool<float>.Shared;
+        float[] aArr = Rent(pool, a, M * K);
+        float[] bArr = Rent(pool, b, N * K);
+        float[] yArr = Rent(pool, y, M * N);
+        try
+        {
+            Parallel.For(0, M, m =>
+            {
+                int aOff = m * K, yOff = m * N;
+                for (int n = 0; n < N; n++)
+                {
+                    float d = Dot(aArr, aOff, bArr, n * K, K);
+                    if (accumulate) yArr[yOff + n] += d;
+                    else yArr[yOff + n] = d;
+                }
+            });
+            yArr.AsSpan(0, M * N).CopyTo(y);
+        }
+        finally
+        {
+            pool.Return(aArr);
+            pool.Return(bArr);
+            pool.Return(yArr);
+        }
+    }
+
+    /// <summary>Sequential twin of <see cref="MatMulRowKernel"/> for small matmuls: no pooling, no Parallel.For.</summary>
+    private static void MatMulRowKernelSeq(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y,
+        int M, int K, int N, bool accumulate, bool aIsTransposed)
+    {
+        for (int m = 0; m < M; m++)
+        {
+            Span<float> yRow = y.Slice(m * N, N);
+            if (!accumulate) yRow.Clear();
+            for (int k = 0; k < K; k++)
+            {
+                float s = aIsTransposed ? a[k * M + m] : a[m * K + k];
+                AddScaled(yRow, b.Slice(k * N, N), s);
+            }
+        }
+    }
 
     /// <summary>
     /// y[m,:] (+)= sum_k a_k * b[k,:], where a_k is a[m,k] (NN) or a[k,m] (TN).
@@ -65,36 +148,6 @@ public sealed class CpuBackend : ITensorBackend
         }
     }
 
-    /// <inheritdoc/>
-    public void MatMulNT(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate = false)
-    {
-        // y[m,n] = dot(a[m,:], b[n,:]); both rows contiguous.
-        var pool = ArrayPool<float>.Shared;
-        float[] aArr = Rent(pool, a, M * K);
-        float[] bArr = Rent(pool, b, N * K);
-        float[] yArr = Rent(pool, y, M * N);
-        try
-        {
-            Parallel.For(0, M, m =>
-            {
-                int aOff = m * K, yOff = m * N;
-                for (int n = 0; n < N; n++)
-                {
-                    float d = Dot(aArr, aOff, bArr, n * K, K);
-                    if (accumulate) yArr[yOff + n] += d;
-                    else yArr[yOff + n] = d;
-                }
-            });
-            yArr.AsSpan(0, M * N).CopyTo(y);
-        }
-        finally
-        {
-            pool.Return(aArr);
-            pool.Return(bArr);
-            pool.Return(yArr);
-        }
-    }
-
     /// <summary>Rents a pooled array of at least <paramref name="length"/> and copies <paramref name="src"/> into it.</summary>
     private static float[] Rent(ArrayPool<float> pool, ReadOnlySpan<float> src, int length)
     {
@@ -114,6 +167,17 @@ public sealed class CpuBackend : ITensorBackend
             dst[dstOff + n] += scale * src[srcOff + n];
     }
 
+    /// <summary>dst[i] += scale * src[i], SIMD. Span twin used by the sequential kernels.</summary>
+    private static void AddScaled(Span<float> dst, ReadOnlySpan<float> src, float scale)
+    {
+        int n = 0, w = Vector<float>.Count;
+        Vector<float> vs = new(scale);
+        for (; n <= dst.Length - w; n += w)
+            (new Vector<float>(dst.Slice(n, w)) + vs * new Vector<float>(src.Slice(n, w))).CopyTo(dst.Slice(n, w));
+        for (; n < dst.Length; n++)
+            dst[n] += scale * src[n];
+    }
+
     /// <summary>SIMD dot product of two equal-length array segments.</summary>
     private static float Dot(float[] x, int xOff, float[] y, int yOff, int length)
     {
@@ -124,6 +188,19 @@ public sealed class CpuBackend : ITensorBackend
         float sum = Vector.Sum(acc);
         for (; i < length; i++)
             sum += x[xOff + i] * y[yOff + i];
+        return sum;
+    }
+
+    /// <summary>SIMD dot product of two equal-length spans. Used by the sequential kernels.</summary>
+    private static float Dot(ReadOnlySpan<float> x, ReadOnlySpan<float> y)
+    {
+        int i = 0, w = Vector<float>.Count;
+        Vector<float> acc = Vector<float>.Zero;
+        for (; i <= x.Length - w; i += w)
+            acc += new Vector<float>(x.Slice(i, w)) * new Vector<float>(y.Slice(i, w));
+        float sum = Vector.Sum(acc);
+        for (; i < x.Length; i++)
+            sum += x[i] * y[i];
         return sum;
     }
 
