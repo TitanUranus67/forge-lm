@@ -1,0 +1,162 @@
+
+namespace LLM.Core.Tests
+{
+    using LLM.Core.Model;
+    using LLM.Core.Tensor;
+    using LLM.Core.Training;
+    using Tensor = LLM.Core.Tensor.Tensor;
+
+    /// <summary>
+    /// Tests for the training stack: LR schedule shape, AdamW mechanics
+    /// (first step size, convergence on a quadratic, decoupled decay only on
+    /// 2-D tensors), DataLoader sampling, and an end-to-end Trainer run that
+    /// must cut the loss to under a quarter of its initial value.
+    /// </summary>
+    public static class TrainingTests
+    {
+        private static readonly CpuBackend B = new();
+
+        private static ModelConfig Small => new(VocabSize: 32, ContextLength: 8, DModel: 16, NLayers: 2, NHeads: 2);
+
+        [Test]
+        public static void LrSchedule_WarmupPeakDecay()
+        {
+            // totalSteps=100, maxLr=1, minLr=0.1, warmup=10
+            Check.Near(LrSchedule.GetLr(0, 100, 1f, 0.1f, 10), 0.1f, 1e-6f, "warmup step 0 = maxLr/warmup");
+            Check.Near(LrSchedule.GetLr(4, 100, 1f, 0.1f, 10), 0.5f, 1e-6f, "warmup midpoint is linear");
+            Check.Near(LrSchedule.GetLr(9, 100, 1f, 0.1f, 10), 1.0f, 1e-6f, "peak at end of warmup");
+            Check.Near(LrSchedule.GetLr(55, 100, 1f, 0.1f, 10), 0.55f, 1e-5f, "cosine midpoint t=0.5 -> (max+min)/2");
+            Check.Near(LrSchedule.GetLr(99, 100, 1f, 0.1f, 10), 0.1f, 2e-3f, "near minLr just before totalSteps");
+            Check.Near(LrSchedule.GetLr(100, 100, 1f, 0.1f, 10), 0.1f, 0f, "exactly minLr at totalSteps");
+            Check.Near(LrSchedule.GetLr(150, 100, 1f, 0.1f, 10), 0.1f, 0f, "clamped to minLr past totalSteps");
+        }
+
+        [Test]
+        public static void AdamW_FirstStepMovesByAboutLr()
+        {
+            var p = new Parameters();
+            Tensor w = p.Add("w", 1, 1);
+            w.Data[0] = 1f;
+            p.Grad("w").Data[0] = 1f;
+
+            var adam = new AdamW();
+            adam.Step(p, lr: 0.1f, weightDecay: 0f);
+            // mHat = vHat = 1 after bias correction, so the step is ~lr in the -grad direction.
+            Check.Near(w.Data[0], 0.9f, 1e-4f, "first AdamW step moves param by ~lr against the gradient");
+        }
+
+        [Test]
+        public static void AdamW_QuadraticConvergesTowardZero()
+        {
+            var p = new Parameters();
+            Tensor w = p.Add("w", 1, 1);
+            Tensor g = p.Grad("w");
+            w.Data[0] = 2f;
+
+            var adam = new AdamW();
+            float prev = Math.Abs(w.Data[0]);
+            for (int step = 0; step < 200; step++)
+            {
+                g.Data[0] = w.Data[0]; // gradient of f(w) = w^2/2
+                adam.Step(p, lr: 0.05f, weightDecay: 0f);
+                float cur = Math.Abs(w.Data[0]);
+                // Far from the optimum the steps point straight at 0; near it,
+                // momentum legitimately overshoots and |w| can tick up briefly.
+                if (step < 30)
+                    Check.True(cur <= prev + 1e-6f, $"|param| decreases while far from 0 (step {step}: {prev} -> {cur})");
+                prev = cur;
+            }
+            Check.True(prev < 0.005f, $"after 200 steps |param| {prev} should be near 0");
+        }
+
+        [Test]
+        public static void AdamW_WeightDecaySkips1D()
+        {
+            var p = new Parameters();
+            Tensor w2d = p.Add("w", 2, 2);
+            Tensor b1d = p.Add("b", 3);
+            w2d.Fill(1f);
+            b1d.Fill(1f);
+            // grads stay zero: only the decoupled decay term can move the weights.
+
+            var adam = new AdamW();
+            adam.Step(p, lr: 1f, weightDecay: 0.5f);
+            foreach (float x in w2d.Data) Check.Near(x, 0.5f, 1e-6f, "2-D param shrinks by lr*wd");
+            foreach (float x in b1d.Data) Check.Near(x, 1.0f, 0f, "1-D param is not weight-decayed");
+        }
+
+        [Test]
+        public static void DataLoader_SampleIsContiguousShiftedWindow()
+        {
+            string path = Path.GetTempFileName();
+            try
+            {
+                using (var bw = new BinaryWriter(File.Create(path)))
+                    for (int i = 0; i < 1000; i++) bw.Write((ushort)i);
+
+                var loader = new DataLoader(path);
+                Check.True(loader.Length == 1000, $"Length {loader.Length} should be 1000");
+
+                var rng = new Random(7);
+                const int ctx = 8;
+                int[] inputs = new int[ctx], targets = new int[ctx];
+                for (int trial = 0; trial < 200; trial++)
+                {
+                    loader.Sample(rng, ctx, inputs, targets);
+                    Check.True(inputs[0] >= 0 && inputs[0] <= 1000 - ctx - 1,
+                        $"offset {inputs[0]} within bounds");
+                    for (int i = 0; i < ctx; i++)
+                    {
+                        Check.True(targets[i] == inputs[i] + 1, $"targets[{i}] = inputs[{i}] + 1");
+                        if (i + 1 < ctx)
+                            Check.True(inputs[i + 1] == inputs[i] + 1, $"inputs contiguous at {i}");
+                    }
+                }
+            }
+            finally { File.Delete(path); }
+        }
+
+        [Test]
+        public static void Trainer_TrainLossDrops()
+        {
+            // Repetitive data: next token is fully predictable (i -> (i+1) mod 16).
+            string path = Path.GetTempFileName();
+            try
+            {
+                using (var bw = new BinaryWriter(File.Create(path)))
+                    for (int i = 0; i < 4096; i++) bw.Write((ushort)(i % 16));
+
+                var train = new DataLoader(path);
+                var val = new DataLoader(path);
+                var model = new GptModel(Small, B, new Random(3));
+                var opts = new TrainOptions
+                {
+                    Steps = 300,
+                    MaxLr = 3e-3f,
+                    MinLr = 3e-4f,
+                    WarmupSteps = 10,
+                    WeightDecay = 0.1f,
+                    GradClip = 1.0f,
+                    Seed = 123,
+                    LogEvery = 50,
+                    ValEvery = 100,
+                };
+
+                var logs = new List<TrainLog>();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                TrainSummary summary = Trainer.Train(model, train, val, opts, logs.Add);
+                sw.Stop();
+
+                float initial = logs[0].TrainLoss;
+                Check.True(summary.Steps == 300, "summary reports step count");
+                Check.True(summary.FinalValLoss is not null, "val loss was evaluated");
+                Check.True(summary.FinalTrainLoss < 0.25f * initial,
+                    $"train loss {initial:F3} -> {summary.FinalTrainLoss:F3}, expected < {0.25f * initial:F3}");
+                Console.WriteLine($"    trainer loss {initial:F4} -> {summary.FinalTrainLoss:F4} " +
+                                  $"(val {summary.FinalValLoss:F4}) in {sw.Elapsed.TotalSeconds:F1}s, {logs.Count} logs");
+                Check.True(sw.Elapsed.TotalSeconds < 15, $"trainer run should take <15s, took {sw.Elapsed.TotalSeconds:F1}s");
+            }
+            finally { File.Delete(path); }
+        }
+    }
+}

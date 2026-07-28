@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LLM.Cli/LLM.Cli.csproj" />
+    <Project Path="src/LLM.Core/LLM.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LLM.Core.Tests/LLM.Core.Tests.csproj" />
+  </Folder>
+</Solution>
