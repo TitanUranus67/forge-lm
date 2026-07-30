@@ -48,8 +48,12 @@ namespace LLM.Core.Checkpoint
             bw.Write(json.Length);
             bw.Write(json);
             foreach (string name in model.Params.Names)
-                foreach (float x in model.Params.Weight(name).Data)
+            {
+                Tensor w = model.Params.Weight(name);
+                model.Backend.EnsureHostCurrent(w); // weights may be device-resident
+                foreach (float x in w.Data)
                     bw.Write(x);
+            }
         }
 
         /// <summary>
@@ -90,6 +94,7 @@ namespace LLM.Core.Checkpoint
                 Tensor w = model.Params.Weight(name);
                 for (int i = 0; i < w.Length; i++)
                     w.Data[i] = br.ReadSingle();
+                backend.InvalidateDeviceCache(w); // host-side write: drop any device copy
             }
             return model;
         }

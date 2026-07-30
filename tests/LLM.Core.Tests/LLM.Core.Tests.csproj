@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\LLM.Core\LLM.Core.csproj" />
@@ -9,6 +9,8 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- GPU tests need a runtime where [UnsafeAccessor] ref-readonly works (.NET 9.0.2 has a JIT bug, fixed in .NET 10); roll to the newest installed runtime when available -->
+    <RollForward>LatestMajor</RollForward>
   </PropertyGroup>
 
 </Project>

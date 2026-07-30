@@ -22,26 +22,36 @@ namespace LLM.Core.Model
         public int In => _w.Shape[0];
         public int Out => _w.Shape[1];
 
-        /// <summary>Forward: x [T,in] -&gt; y [T,out]. Caches x for Backward.</summary>
-        public Tensor Forward(Tensor x)
+        /// <summary>Forward: x [T,in] -&gt; y [T,out]. Caches x for Backward unless
+        /// <paramref name="cacheX"/> is false (the caller then passes x explicitly to
+        /// <see cref="Backward(Tensor, Tensor)"/> — used when the input is recomputed
+        /// instead of cached to save device memory).</summary>
+        public Tensor Forward(Tensor x, bool cacheX = true)
         {
-            _x = x;
+            _x = cacheX ? x : null;
             int t = x.Shape[0];
             var y = new Tensor(t, Out);
-            _backend.MatMulNN(x.Data, _w.Data, y.Data, t, In, Out);
-            _backend.AddBias(y.Data, _b.Data, t, Out);
+            _backend.MatMulNN(x, _w, y, t, In, Out);
+            _backend.AddBias(y, _b, t, Out);
             return y;
         }
 
-        /// <summary>Backward: dY [T,out] -&gt; dX [T,in]; accumulates dW, dB.</summary>
+        /// <summary>Backward: dY [T,out] -&gt; dX [T,in]; accumulates dW, dB. Releases the cached forward input.</summary>
         public Tensor Backward(Tensor dY)
         {
             Tensor x = _x ?? throw new InvalidOperationException("Forward must run before Backward.");
+            return Backward(dY, x);
+        }
+
+        /// <summary>Backward with an explicitly supplied forward input (e.g. a recomputed activation).</summary>
+        public Tensor Backward(Tensor dY, Tensor x)
+        {
+            _x = null; // release the activation for the allocator right after its last use
             int t = x.Shape[0];
-            _backend.MatMulTN(x.Data, dY.Data, _dW.Data, In, t, Out, accumulate: true);
-            _backend.SumRows(dY.Data, _dB.Data, t, Out);
+            _backend.MatMulTN(x, dY, _dW, In, t, Out, accumulate: true);
+            _backend.SumRows(dY, _dB, t, Out);
             var dX = new Tensor(t, In);
-            _backend.MatMulNT(dY.Data, _w.Data, dX.Data, t, Out, In);
+            _backend.MatMulNT(dY, _w, dX, t, Out, In);
             return dX;
         }
     }
@@ -73,18 +83,19 @@ namespace LLM.Core.Model
             var y = new Tensor(t, C);
             _mean = new Tensor(t);
             _rstd = new Tensor(t);
-            _backend.LayerNormForward(x.Data, _w.Data, _b.Data, y.Data, _mean.Data, _rstd.Data, t, C, Eps);
+            _backend.LayerNormForward(x, _w, _b, y, _mean, _rstd, t, C, Eps);
             return y;
         }
 
-        /// <summary>Backward: dY [T,C] -&gt; dX [T,C]; accumulates dW, dB.</summary>
+        /// <summary>Backward: dY [T,C] -&gt; dX [T,C]; accumulates dW, dB. Releases the forward caches.</summary>
         public Tensor Backward(Tensor dY)
         {
             if (_x is null || _mean is null || _rstd is null)
                 throw new InvalidOperationException("Forward must run before Backward.");
             int t = _x.Shape[0];
             var dX = new Tensor(t, C);
-            _backend.LayerNormBackward(dY.Data, _x.Data, _w.Data, _mean.Data, _rstd.Data, dX.Data, _dW.Data, _dB.Data, t, C);
+            _backend.LayerNormBackward(dY, _x, _w, _mean, _rstd, dX, _dW, _dB, t, C);
+            _x = _mean = _rstd = null; // release activations right after their last use
             return dX;
         }
     }
@@ -94,7 +105,9 @@ namespace LLM.Core.Model
     /// scaled dot-product attention with causal mask, head concatenation, output
     /// projection. Input/output are [B*T, DModel]: B independent sequences of T rows
     /// stacked row-wise (B = 1 is plain single-sequence inference). Attention never
-    /// crosses sequence boundaries; heads and sequences are processed with simple loops.
+    /// crosses sequence boundaries. The (sequence, head) slots are packed into single
+    /// slot-contiguous tensors ([B*H*T, ...]) and processed with the batched kernels,
+    /// so one layer costs a constant number of backend calls regardless of B*H.
     /// </summary>
     public sealed class MultiHeadAttention
     {
@@ -102,8 +115,12 @@ namespace LLM.Core.Model
         private readonly int _nHeads, _headDim, _dModel;
         private readonly float _invScale;
 
-        // per-(sequence, head) forward caches, laid out [batch * nHeads]
-        private Tensor[]? _q, _k, _v, _probs;
+        // forward cache: the fused QKV projection output [B*T, 3D]. The packed
+        // Q/K/V and attention probs are NOT cached — Backward rebuilds them from
+        // this one tensor (3 packs + the scores matmul + softmax), which cuts the
+        // per-layer activation cache by ~4x (one [B*T,3D] instead of three packed
+        // [B*H*T,HD] plus the [B*H*T,T] probs) at ~1% extra compute.
+        private Tensor? _qkv;
         private int _t, _batch = 1;
 
         public MultiHeadAttention(ITensorBackend backend, int nHeads, int dModel, Linear qkv, Linear proj)
@@ -125,7 +142,8 @@ namespace LLM.Core.Model
 
         /// <summary>
         /// Forward: x [B*T,D] -&gt; y [B*T,D]; every block of T consecutive rows is an
-        /// independent sequence. Caches per-(sequence, head) Q, K, V and attention probs.
+        /// independent sequence. Caches the fused QKV projection for Backward (packed
+        /// Q/K/V and probs are rebuilt from it there).
         /// </summary>
         public Tensor Forward(Tensor x, int batch = 1)
         {
@@ -138,96 +156,77 @@ namespace LLM.Core.Model
             Tensor qkv = Qkv.Forward(x); // [B*T, 3D]
 
             int slots = batch * _nHeads;
-            _q = new Tensor[slots];
-            _k = new Tensor[slots];
-            _v = new Tensor[slots];
-            _probs = new Tensor[slots];
+            int hd = _headDim;
+            var q = new Tensor(slots * t, hd);
+            var k = new Tensor(slots * t, hd);
+            var v = new Tensor(slots * t, hd);
+            _b.PackHeads(qkv, q, batch, t, _nHeads, hd, 0);
+            _b.PackHeads(qkv, k, batch, t, _nHeads, hd, _dModel);
+            _b.PackHeads(qkv, v, batch, t, _nHeads, hd, 2 * _dModel);
+
+            var probs = new Tensor(slots * t, t); // scores -> softmax in place
+            _b.BatchedMatMulNT(q, k, probs, slots, t, hd, t);
+            _b.Scale(probs, _invScale);
+            _b.CausalMask(probs, t);
+            _b.SoftmaxForward(probs, slots * t, t);
+
+            var ctx = new Tensor(slots * t, hd);
+            _b.BatchedMatMulNN(probs, v, ctx, slots, t, t, hd);
+
             var concat = new Tensor(rows, _dModel);
+            _b.UnpackHeads(ctx, concat, batch, t, _nHeads, hd, 0);
 
-            // (sequence, head) slots are fully independent: parallelize over them.
-            // The small per-slot matmuls take the backend's sequential path, so
-            // there is no nested Parallel.For.
-            Parallel.For(0, slots, s =>
-            {
-                int row0 = (s / _nHeads) * t;
-                int h = s % _nHeads;
-                int hd = _headDim;
-                var q = new Tensor(t, hd);
-                var k = new Tensor(t, hd);
-                var v = new Tensor(t, hd);
-                SliceHead(qkv, q, row0, h * hd);
-                SliceHead(qkv, k, row0, _dModel + h * hd);
-                SliceHead(qkv, v, row0, 2 * _dModel + h * hd);
-
-                var probs = new Tensor(t, t); // scores -> softmax in place
-                _b.MatMulNT(q.Data, k.Data, probs.Data, t, hd, t);
-                _b.Scale(probs.Data, _invScale);
-                _b.CausalMask(probs.Data, t);
-                _b.SoftmaxForward(probs.Data, t, t);
-
-                var ctx = new Tensor(t, hd);
-                _b.MatMulNN(probs.Data, v.Data, ctx.Data, t, t, hd);
-                MergeHead(concat, ctx, row0, h * hd);
-
-                _q[s] = q; _k[s] = k; _v[s] = v; _probs[s] = probs;
-            });
-
+            _qkv = qkv;
             return Proj.Forward(concat);
         }
 
         /// <summary>Backward: dY [B*T,D] -&gt; dX [B*T,D]; accumulates into Qkv/Proj parameter grads.</summary>
         public Tensor Backward(Tensor dY)
         {
-            if (_q is null || _k is null || _v is null || _probs is null)
+            if (_qkv is null)
                 throw new InvalidOperationException("Forward must run before Backward.");
-            int t = _t;
+            int t = _t, batch = _batch;
+            int slots = batch * _nHeads;
             int hd = _headDim;
             Tensor dConcat = Proj.Backward(dY); // [B*T,D]
+
+            // rebuild the packed forward caches from the fused QKV projection
+            var q = new Tensor(slots * t, hd);
+            var k = new Tensor(slots * t, hd);
+            var v = new Tensor(slots * t, hd);
+            _b.PackHeads(_qkv, q, batch, t, _nHeads, hd, 0);
+            _b.PackHeads(_qkv, k, batch, t, _nHeads, hd, _dModel);
+            _b.PackHeads(_qkv, v, batch, t, _nHeads, hd, 2 * _dModel);
+            var probs = new Tensor(slots * t, t);
+            _b.BatchedMatMulNT(q, k, probs, slots, t, hd, t);
+            _b.Scale(probs, _invScale);
+            _b.CausalMask(probs, t);
+            _b.SoftmaxForward(probs, slots * t, t);
+            _qkv = null; // release the forward cache right after the rebuild
+
+            var dCtx = new Tensor(slots * t, hd);
+            _b.PackHeads(dConcat, dCtx, batch, t, _nHeads, hd, 0);
+
+            var dProbs = new Tensor(slots * t, t);
+            _b.BatchedMatMulNT(dCtx, v, dProbs, slots, t, hd, t);
+            var dV = new Tensor(slots * t, hd);
+            _b.BatchedMatMulTN(probs, dCtx, dV, slots, t, t, hd);
+
+            var dScores = new Tensor(slots * t, t);
+            _b.SoftmaxBackward(dProbs, probs, dScores, slots * t, t);
+            _b.Scale(dScores, _invScale);
+
+            var dQ = new Tensor(slots * t, hd);
+            _b.BatchedMatMulNN(dScores, k, dQ, slots, t, t, hd);
+            var dK = new Tensor(slots * t, hd);
+            _b.BatchedMatMulTN(dScores, q, dK, slots, t, t, hd);
+
             var dQkv = new Tensor(dY.Shape[0], 3 * _dModel);
-
-            Parallel.For(0, _batch * _nHeads, s =>
-            {
-                int row0 = (s / _nHeads) * t;
-                int h = s % _nHeads;
-                var dCtx = new Tensor(t, hd);
-                SliceHead(dConcat, dCtx, row0, h * hd);
-
-                var dProbs = new Tensor(t, t);
-                _b.MatMulNT(dCtx.Data, _v[s].Data, dProbs.Data, t, hd, t);
-                var dV = new Tensor(t, hd);
-                _b.MatMulTN(_probs[s].Data, dCtx.Data, dV.Data, t, t, hd);
-
-                var dScores = new Tensor(t, t);
-                _b.SoftmaxBackward(dProbs.Data, _probs[s].Data, dScores.Data, t, t);
-                _b.Scale(dScores.Data, _invScale);
-
-                var dQ = new Tensor(t, hd);
-                _b.MatMulNN(dScores.Data, _k[s].Data, dQ.Data, t, t, hd);
-                var dK = new Tensor(t, hd);
-                _b.MatMulTN(dScores.Data, _q[s].Data, dK.Data, t, t, hd);
-
-                MergeHead(dQkv, dQ, row0, h * hd);
-                MergeHead(dQkv, dK, row0, _dModel + h * hd);
-                MergeHead(dQkv, dV, row0, 2 * _dModel + h * hd);
-            });
-
+            _b.Zero(dQkv); // the three unpacks below fully cover it — keep the device copy authoritative
+            _b.UnpackHeads(dQ, dQkv, batch, t, _nHeads, hd, 0);
+            _b.UnpackHeads(dK, dQkv, batch, t, _nHeads, hd, _dModel);
+            _b.UnpackHeads(dV, dQkv, batch, t, _nHeads, hd, 2 * _dModel);
             return Qkv.Backward(dQkv);
-        }
-
-        /// <summary>dst[t, 0..cols) = src[rowOffset+t, colOffset..colOffset+cols) — extract one head's columns of one sequence.</summary>
-        private static void SliceHead(Tensor src, Tensor dst, int rowOffset, int colOffset)
-        {
-            int t = dst.Shape[0], cols = dst.Shape[1], srcCols = src.Shape[1];
-            for (int i = 0; i < t; i++)
-                Array.Copy(src.Data, (rowOffset + i) * srcCols + colOffset, dst.Data, i * cols, cols);
-        }
-
-        /// <summary>dst[rowOffset+t, colOffset..colOffset+cols) = src[t, 0..cols) — write one head's columns of one sequence back.</summary>
-        private static void MergeHead(Tensor dst, Tensor src, int rowOffset, int colOffset)
-        {
-            int t = src.Shape[0], cols = src.Shape[1], dstCols = dst.Shape[1];
-            for (int i = 0; i < t; i++)
-                Array.Copy(src.Data, i * cols, dst.Data, (rowOffset + i) * dstCols + colOffset, cols);
         }
     }
 
@@ -252,23 +251,27 @@ namespace LLM.Core.Model
         /// <summary>Contraction projection [4D, D].</summary>
         public Linear Proj { get; }
 
-        /// <summary>Forward: x [T,D] -&gt; y [T,D]. Caches the pre-GELU activations.</summary>
+        /// <summary>Forward: x [T,D] -&gt; y [T,D]. Caches only the pre-GELU activations;
+        /// the GELU output is recomputed from them in Backward (halves the cached MLP memory).</summary>
         public Tensor Forward(Tensor x)
         {
             _fcOut = Fc.Forward(x);
             int t = x.Shape[0];
             var h = new Tensor(t, Fc.Out);
-            _b.GeluForward(_fcOut.Data, h.Data);
-            return Proj.Forward(h);
+            _b.GeluForward(_fcOut, h);
+            return Proj.Forward(h, cacheX: false); // h dies here; Backward recomputes it
         }
 
-        /// <summary>Backward: dY [T,D] -&gt; dX [T,D]; accumulates into Fc/Proj parameter grads.</summary>
+        /// <summary>Backward: dY [T,D] -&gt; dX [T,D]; accumulates into Fc/Proj parameter grads. Releases the activation cache.</summary>
         public Tensor Backward(Tensor dY)
         {
             if (_fcOut is null) throw new InvalidOperationException("Forward must run before Backward.");
-            Tensor dH = Proj.Backward(dY);
+            var h = new Tensor(_fcOut.Shape[0], _fcOut.Shape[1]);
+            _b.GeluForward(_fcOut, h); // recompute the GELU output Proj saw in Forward
+            Tensor dH = Proj.Backward(dY, h);
             var dA = new Tensor(dH.Shape[0], dH.Shape[1]);
-            _b.GeluBackward(dH.Data, _fcOut.Data, dA.Data);
+            _b.GeluBackward(dH, _fcOut, dA);
+            _fcOut = null; // release right after its last use
             return Fc.Backward(dA);
         }
     }
@@ -295,7 +298,7 @@ namespace LLM.Core.Model
         {
             _indices = indices.ToArray();
             var output = new Tensor(_indices.Length, D);
-            _b.EmbeddingForward(_table.Data, _indices, output.Data, D);
+            _b.EmbeddingForward(_table, _indices, output, D);
             return output;
         }
 
@@ -303,7 +306,7 @@ namespace LLM.Core.Model
         public void Backward(Tensor dOut)
         {
             if (_indices is null) throw new InvalidOperationException("Forward must run before Backward.");
-            _b.EmbeddingBackward(dOut.Data, _indices, _dTable.Data, D);
+            _b.EmbeddingBackward(dOut, _indices, _dTable, D);
         }
     }
 
@@ -331,24 +334,26 @@ namespace LLM.Core.Model
         public Tensor Forward(Tensor x, int batch = 1)
         {
             Tensor a = Attn.Forward(Ln1.Forward(x), batch);
-            _x2 = x.Clone();
-            _b.AddInPlace(_x2.Data, a.Data);
+            _b.AddInPlace(a, x); // a += x: the sub-block output becomes the residual midpoint
+            _x2 = a;
             Tensor m = Mlp.Forward(Ln2.Forward(_x2));
-            var y = _x2.Clone();
-            _b.AddInPlace(y.Data, m.Data);
-            return y;
+            _b.AddInPlace(m, _x2); // m += x2: the MLP output becomes the block output
+            return m;
         }
 
-        /// <summary>Backward: dY [B*T,D] -&gt; dX [B*T,D]; accumulates all sub-block parameter grads.</summary>
+        /// <summary>Backward: dY [B*T,D] -&gt; dX [B*T,D]; accumulates all sub-block parameter grads. Releases the residual cache.</summary>
         public Tensor Backward(Tensor dY)
         {
             if (_x2 is null) throw new InvalidOperationException("Forward must run before Backward.");
+            _x2 = null; // not needed by the backward math — release the midpoint residual early
             // y = x2 + mlp(ln2(x2))
-            var dX2 = dY.Clone();
-            _b.AddInPlace(dX2.Data, Ln2.Backward(Mlp.Backward(dY)).Data);
+            var dX2 = new Tensor(dY.Shape);
+            _b.Copy(dY, dX2);
+            _b.AddInPlace(dX2, Ln2.Backward(Mlp.Backward(dY)));
             // x2 = x + attn(ln1(x))
-            var dX = dX2.Clone();
-            _b.AddInPlace(dX.Data, Ln1.Backward(Attn.Backward(dX2)).Data);
+            var dX = new Tensor(dY.Shape);
+            _b.Copy(dX2, dX);
+            _b.AddInPlace(dX, Ln1.Backward(Attn.Backward(dX2)));
             return dX;
         }
     }

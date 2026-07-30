@@ -32,6 +32,10 @@ public sealed class Tensor
         Shape = shape;
     }
 
+    /// <summary>Opaque backend-owned device resource (e.g. GPU buffer). Null when host-only.
+    /// Managed exclusively by ITensorBackend implementations; model code must not touch it.</summary>
+    internal object? DeviceResource { get; set; }
+
     public int Rank => Shape.Length;
     public int Rows => Shape[^2];
     public int Cols => Shape[^1];

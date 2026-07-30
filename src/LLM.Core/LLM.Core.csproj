@@ -1,9 +1,17 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- ComputeSharp shader source generators emit unsafe code -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- ComputeSharp's D3D12 interop is Windows-only; the rest of the library stays cross-platform -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ComputeSharp" Version="3.2.0" />
+  </ItemGroup>
 
 </Project>

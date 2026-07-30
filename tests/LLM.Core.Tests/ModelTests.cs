@@ -93,7 +93,7 @@ namespace LLM.Core.Tests
             {
                 Tensor logits = model.Forward(inputs);
                 var probs = new Tensor(inputs.Length, config.VocabSize);
-                return B.CrossEntropyForward(logits.Data, targets, probs.Data, inputs.Length, config.VocabSize, -1);
+                return B.CrossEntropyForward(logits, targets, probs, inputs.Length, config.VocabSize, -1);
             }
 
             float maxErr = 0f;

@@ -4,6 +4,7 @@ using LLM.Core.Checkpoint;
 using LLM.Core.Inference;
 using LLM.Core.Model;
 using LLM.Core.Tensor;
+using LLM.Core.Tensor.Gpu;
 using LLM.Core.Tokenizer;
 using LLM.Core.Training;
 
@@ -21,6 +22,7 @@ try
     return args[0] switch
     {
         "prepare" => Cli.Prepare(args[1..]),
+        "prepare-fineweb" => Cli.PrepareFineWeb(args[1..]),
         "train" => Cli.Train(args[1..]),
         "generate" => Cli.Generate(args[1..]),
         "chat" => Cli.Chat(args[1..]),
@@ -29,11 +31,11 @@ try
 }
 catch (Exception ex) when (ex is not OperationCanceledException)
 {
-    Console.Error.WriteLine($"error: {ex.Message}");
+    Console.Error.WriteLine($"error: {ex.Message}\n{ex.StackTrace}");
     return 1;
 }
 
-internal static class Cli
+internal static partial class Cli
 {
     private const string DefaultCorpusUrl =
         "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
@@ -50,19 +52,45 @@ internal static class Cli
 
         Usage:
           llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
+          llm prepare-fineweb --out <dir> [--shards 10] [--merges 16000] [--toktrainmb 200]
           llm train     --data <dir> [--steps 5000] [--dmodel 128] [--layers 4] [--heads 4]
                         [--ctx 128] [--batch 8] [--lr 6e-4] [--minlr 6e-5] [--warmup 100] [--wd 0.1]
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
-                        [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
+                        [--saveevery 0] [--out out/model.bin] [--init <checkpoint>] [--backend cpu|gpu]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
-                        [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1]
+                        [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend cpu|gpu]
           llm chat      --model <checkpoint> --tokenizer <dir-or-path>
-                        [--tokens 100] [--temperature 0.8] [--topk 40] [--seed 1]
+                        [--tokens 100] [--temperature 0.8] [--topk 40] [--seed 1] [--backend cpu|gpu]
 
         There is no separate train-tokenizer command: tokenizer training is folded
         into `prepare` (use --tokenizer to supply a pre-trained one).
-        Run any command with --help for details.
+        --backend gpu runs all tensor math on the default D3D12 device (ComputeSharp);
+        the default is cpu. Run any command with --help for details.
         """);
+
+    /// <summary>Creates the tensor backend for --backend cpu|gpu and prints the selection.</summary>
+    private static ITensorBackend CreateBackend(string name)
+    {
+        if (name.Equals("cpu", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("backend: cpu");
+            return new CpuBackend();
+        }
+        if (name.Equals("gpu", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var gpu = new GpuBackend();
+                Console.WriteLine($"backend: gpu ({gpu.DeviceName}, {gpu.DeviceMemoryBytes / 1e9:F1} GB)");
+                return gpu;
+            }
+            catch (Exception ex)
+            {
+                throw new ArgumentException($"--backend gpu requested, but no D3D12 device is available: {ex.Message}");
+            }
+        }
+        throw new ArgumentException($"unknown backend '{name}' (expected cpu or gpu)");
+    }
 
     // ---- prepare -------------------------------------------------------------
 
@@ -180,7 +208,8 @@ internal static class Cli
                   Each optimizer step processes --batch sequences (default 8) at once.
                   --init resumes from an existing checkpoint (config comes from it;
                   the architecture flags are then ignored). --saveevery N writes the
-                  checkpoint every N steps. Ctrl+C stops after the current step and
+                  checkpoint every N steps. --backend gpu runs training on the default
+                  D3D12 device. Ctrl+C stops after the current step and
                   still saves, so an interrupted run is never lost.
                 """);
             return 0;
@@ -204,9 +233,10 @@ internal static class Cli
         string outPath = p.Get("out", Path.Combine("out", "model.bin"));
         string? init = p.Get("init");
         int saveevery = p.GetInt("saveevery", 0);
+        string backendName = p.Get("backend", "cpu");
         p.Done();
 
-        var backend = new CpuBackend();
+        ITensorBackend backend = CreateBackend(backendName);
         GptModel model;
         if (init is not null)
         {
@@ -245,13 +275,7 @@ internal static class Cli
             SaveEvery = saveevery,
         };
 
-        void OnLog(TrainLog l)
-        {
-            double tokSec = l.Step * (double)model.Config.ContextLength * batch / Math.Max(l.Elapsed.TotalSeconds, 1e-9);
-            string val = l.ValLoss.HasValue ? $"  val {l.ValLoss.Value:F4}" : "";
-            Console.WriteLine($"step {l.Step,6}/{steps}  lr {l.Lr:E2}  loss {l.TrainLoss:F4}{val}  " +
-                              $"{tokSec:N0} tok/s  ({l.Elapsed:mm\\:ss})");
-        }
+        var display = new TrainDisplay(steps, model.Config.ContextLength * batch);
 
         string? outDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
         if (outDir is not null) Directory.CreateDirectory(outDir);
@@ -262,7 +286,7 @@ internal static class Cli
             string tmp = outPath + ".tmp";
             Checkpoint.Save(m, tmp);
             File.Move(tmp, outPath, overwrite: true);
-            Console.WriteLine($"checkpoint: saved {outPath} ({tag})");
+            display.PrintLine($"checkpoint: saved {outPath} ({tag})");
         }
 
         // Ctrl+C cancels after the current step; the checkpoint below is still written
@@ -277,12 +301,42 @@ internal static class Cli
             }
         };
 
-        TrainSummary summary = Trainer.Train(model, trainLoader, valLoader, opts, OnLog,
-            onSave: saveevery > 0 ? (m, s) => SaveCheckpoint(m, $"step {s}") : null,
-            cancel: cts.Token);
+        // polled once per step by the trainer; 'p' pauses, then r/s/q resumes/saves/quits.
+        // KeyAvailable throws when stdin is redirected, so guard with IsInputRedirected.
+        bool stoppedByUser = false;
+        TrainCommand ControlHook(int step)
+        {
+            if (Console.IsInputRedirected || !Console.KeyAvailable) return TrainCommand.Continue;
+            if (char.ToLowerInvariant(Console.ReadKey(intercept: true).KeyChar) != 'p')
+                return TrainCommand.Continue;
 
-        string interrupted = summary.Steps < steps ? $" (interrupted at step {summary.Steps}/{steps})" : "";
-        Console.WriteLine($"done: {summary.Steps} steps in {summary.Elapsed:mm\\:ss}{interrupted}, " +
+            display.PrintLine("paused — [r]esume, [s]ave+resume, [q]save+quit");
+            while (true)
+            {
+                switch (char.ToLowerInvariant(Console.ReadKey(intercept: true).KeyChar))
+                {
+                    case 'r': return TrainCommand.Continue;
+                    case 's':
+                        SaveCheckpoint(model, "manual save");
+                        return TrainCommand.Continue;
+                    case 'q':
+                        stoppedByUser = true;
+                        return TrainCommand.SaveAndQuit;
+                }
+            }
+        }
+
+        Console.WriteLine("controls: p = pause, Ctrl+C = save and quit");
+        TrainSummary summary = Trainer.Train(model, trainLoader, valLoader, opts, display.OnLog,
+            onSave: saveevery > 0 ? (m, s) => SaveCheckpoint(m, $"step {s}") : null,
+            cancel: cts.Token, controlHook: ControlHook);
+
+        display.Complete();
+        if (stoppedByUser)
+            Console.WriteLine($"stopped by user at step {summary.Steps}");
+        string interrupted = !stoppedByUser && summary.Steps < steps
+            ? $" (interrupted at step {summary.Steps}/{steps})" : "";
+        Console.WriteLine($"done: {summary.Steps} steps in {summary.Elapsed:h\\:mm\\:ss}{interrupted}, " +
                           $"final train loss {summary.FinalTrainLoss:F4}" +
                           (summary.FinalValLoss.HasValue ? $", final val loss {summary.FinalValLoss.Value:F4}" : ""));
         SaveCheckpoint(model, "final");
@@ -313,11 +367,12 @@ internal static class Cli
         float temperature = p.GetFloat("temperature", 0.8f);
         int topk = p.GetInt("topk", 40);
         int seed = p.GetInt("seed", 1);
+        string backendName = p.Get("backend", "cpu");
         p.Done();
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;
         var tok = BpeTokenizer.Load(tokPath);
-        var model = Checkpoint.Load(modelPath, new CpuBackend());
+        var model = Checkpoint.Load(modelPath, CreateBackend(backendName));
         Console.WriteLine($"model: {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                           $"params {model.Params.Count:N0})");
 
@@ -368,11 +423,12 @@ internal static class Cli
         float temperature = p.GetFloat("temperature", 0.8f);
         int topk = p.GetInt("topk", 40);
         int seed = p.GetInt("seed", 1);
+        string backendName = p.Get("backend", "cpu");
         p.Done();
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;
         var tok = BpeTokenizer.Load(tokPath);
-        var model = Checkpoint.Load(modelPath, new CpuBackend());
+        var model = Checkpoint.Load(modelPath, CreateBackend(backendName));
         var rng = new Random(seed);
 
         Console.WriteLine($"model: {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +

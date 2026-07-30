@@ -1,0 +1,299 @@
+using System.Diagnostics;
+using System.Text.Json;
+using LLM.Core.Tokenizer;
+using Parquet;
+using Parquet.Schema;
+
+// `prepare-fineweb`: download FineWeb (sample-10BT) parquet shards from
+// Hugging Face, extract the `text` column into a corpus, then run the same
+// tokenizer + uint16-bin flow as `prepare`, but streaming so a multi-GB
+// corpus never has to fit in memory.
+
+internal static partial class Cli
+{
+    private const string FineWebListUrl =
+        "https://huggingface.co/api/datasets/HuggingFaceFW/fineweb/tree/main/sample/10BT";
+    private const string FineWebResolveUrl =
+        "https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/";
+
+    private const int EncodeChunkSize = 50 << 20; // 50 MB encode chunks, split at newlines
+
+    internal static int PrepareFineWeb(string[] args)
+    {
+        var p = new Args(args);
+        if (p.Help)
+        {
+            Console.WriteLine("""
+                llm prepare-fineweb --out <dir> [--shards 10] [--merges 16000] [--toktrainmb 200]
+
+                  Downloads the first --shards parquet shards of FineWeb sample-10BT
+                  from Hugging Face into <out>/shards (existing files are skipped,
+                  so reruns resume), extracts the `text` column into <out>/corpus.txt,
+                  trains a byte-level BPE tokenizer on the first --toktrainmb MB only,
+                  then stream-encodes the full corpus in 50 MB chunks and writes the
+                  usual tokenizer.json + train.bin/val.bin (90/10, LE uint16).
+                """);
+            return 0;
+        }
+
+        string outDir = p.Require("out");
+        int shards = p.GetInt("shards", 10);
+        int merges = p.GetInt("merges", 16000);
+        int tokTrainMb = p.GetInt("toktrainmb", 200);
+        p.Done();
+
+        const int maxMerges = 65536 - 256; // uint16 token files cap the vocab at 65536
+        if (merges < 0 || merges > maxMerges)
+            throw new ArgumentException($"--merges must be in [0, {maxMerges}] (uint16 token ids cap vocab at 65536).");
+        if (shards < 1) throw new ArgumentException("--shards must be >= 1");
+        if (tokTrainMb < 1) throw new ArgumentException("--toktrainmb must be >= 1");
+
+        string shardDir = Path.Combine(outDir, "shards");
+        string corpusPath = Path.Combine(outDir, "corpus.txt");
+        Directory.CreateDirectory(shardDir);
+
+        using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        var swTotal = Stopwatch.StartNew();
+
+        // 1. list + download shards (skip complete ones)
+        List<(string Path, long Size)> all = ListFineWebShards(http);
+        var wanted = all.Take(shards).ToList();
+        Console.WriteLine($"fineweb: {all.Count} shards available, using first {wanted.Count}");
+        var localShards = new List<string>(wanted.Count);
+        foreach ((string path, long size) in wanted)
+        {
+            string local = Path.Combine(shardDir, Path.GetFileName(path));
+            if (File.Exists(local) && new FileInfo(local).Length == size)
+            {
+                Console.WriteLine($"fineweb: reusing {local} ({size / 1e9:F2} GB)");
+            }
+            else
+            {
+                Download(http, FineWebResolveUrl + path, local, size);
+            }
+            localShards.Add(local);
+        }
+
+        // 2. extract the text column -> corpus.txt (streamed, one \n between docs)
+        long docs = 0;
+        if (File.Exists(corpusPath))
+        {
+            Console.WriteLine($"corpus: reusing {corpusPath} ({new FileInfo(corpusPath).Length / 1e9:F2} GB)");
+        }
+        else
+        {
+            var sw = Stopwatch.StartNew();
+            foreach (string shard in localShards)
+                docs += ExtractText(shard, corpusPath).GetAwaiter().GetResult();
+            Console.WriteLine($"corpus: {docs:N0} docs, {new FileInfo(corpusPath).Length:N0} bytes " +
+                              $"in {sw.Elapsed.TotalSeconds:F1}s");
+        }
+        long corpusBytes = new FileInfo(corpusPath).Length;
+
+        // 3. tokenizer: reuse an existing one, else train on the first --toktrainmb MB only
+        string tokOut = Path.Combine(outDir, "tokenizer.json");
+        BpeTokenizer tok;
+        if (File.Exists(tokOut))
+        {
+            tok = BpeTokenizer.Load(tokOut);
+            Console.WriteLine($"tokenizer: reusing {tokOut} (vocab {tok.VocabSize})");
+        }
+        else
+        {
+            byte[] trainBytes = ReadHead(corpusPath, tokTrainMb << 20);
+            Console.WriteLine($"tokenizer: training {merges} merges on first {trainBytes.Length / (1 << 20)} MB...");
+            var sw = Stopwatch.StartNew();
+            tok = BpeTokenizer.Train(trainBytes, merges, (done, total) =>
+            {
+                if (done % 100 == 0 || done == total)
+                    Console.WriteLine($"tokenizer: {done}/{total} merges ({sw.Elapsed.TotalSeconds:F1}s)");
+            });
+            tok.Save(tokOut);
+            Console.WriteLine($"tokenizer: saved {tokOut} (vocab {tok.VocabSize})");
+        }
+
+        // 4. stream-encode the full corpus to a temp bin, then split 90/10
+        string tmpBin = Path.Combine(outDir, "tokens.tmp");
+        long tokens;
+        {
+            Console.WriteLine($"encoding {corpusBytes / 1e9:F2} GB corpus in {EncodeChunkSize >> 20} MB chunks...");
+            var sw = Stopwatch.StartNew();
+            tokens = StreamEncode(tok, corpusPath, tmpBin, sw);
+            Console.WriteLine($"encoded {tokens:N0} tokens in {sw.Elapsed.TotalMinutes:F1} min " +
+                              $"({tokens / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):N0} tok/s)");
+        }
+        long cut = (long)(tokens * 0.9);
+        SplitBin(tmpBin, cut * 2, Path.Combine(outDir, "train.bin"), Path.Combine(outDir, "val.bin"));
+        File.Delete(tmpBin);
+
+        Console.WriteLine($"train.bin: {cut:N0} tokens, val.bin: {tokens - cut:N0} tokens");
+        Console.WriteLine($"stats: {corpusBytes:N0} bytes -> {tokens:N0} tokens, vocab {tok.VocabSize}, " +
+                          $"compression {corpusBytes / (double)tokens:F2}x, " +
+                          $"~{tokens / wanted.Count:N0} tokens/shard ({docs:N0} docs)");
+        Console.WriteLine($"total elapsed: {swTotal.Elapsed:h\\:mm\\:ss}");
+        return 0;
+    }
+
+    /// <summary>Lists parquet shards of the sample-10BT config via the HF API, sorted by path.</summary>
+    private static List<(string Path, long Size)> ListFineWebShards(HttpClient http)
+    {
+        string json = http.GetStringAsync(FineWebListUrl).GetAwaiter().GetResult();
+        using var doc = JsonDocument.Parse(json);
+        var shards = new List<(string, long)>();
+        foreach (JsonElement e in doc.RootElement.EnumerateArray())
+        {
+            string? path = e.GetProperty("path").GetString();
+            if (e.GetProperty("type").GetString() == "file" &&
+                path is not null && path.EndsWith(".parquet", StringComparison.Ordinal))
+                shards.Add((path, e.GetProperty("size").GetInt64()));
+        }
+        shards.Sort((a, b) => string.CompareOrdinal(a.Item1, b.Item1));
+        if (shards.Count == 0)
+            throw new InvalidDataException($"no parquet shards listed at {FineWebListUrl}");
+        return shards;
+    }
+
+    /// <summary>Downloads one shard with progress; partial files go to *.part first.</summary>
+    private static void Download(HttpClient http, string url, string local, long size)
+    {
+        string part = local + ".part";
+        Console.WriteLine($"fineweb: downloading {url} ({size / 1e9:F2} GB)");
+        var sw = Stopwatch.StartNew();
+        using (var response = http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult())
+        {
+            response.EnsureSuccessStatusCode();
+            using var src = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
+            using var dst = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+            var buf = new byte[8 << 20];
+            long got = 0, nextReport = 512 << 20;
+            int r;
+            while ((r = src.Read(buf, 0, buf.Length)) > 0)
+            {
+                dst.Write(buf, 0, r);
+                got += r;
+                if (got >= nextReport)
+                {
+                    Console.WriteLine($"fineweb: {got / 1e9:F2}/{size / 1e9:F2} GB " +
+                                      $"({got / 1e6 / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):F0} MB/s)");
+                    nextReport += 512 << 20;
+                }
+            }
+        }
+        File.Move(part, local, overwrite: true);
+        Console.WriteLine($"fineweb: saved {local} in {sw.Elapsed.TotalMinutes:F1} min");
+    }
+
+    /// <summary>Appends the `text` column of one parquet shard to the corpus; returns doc count.</summary>
+    private static async Task<long> ExtractText(string shardPath, string corpusPath)
+    {
+        Console.WriteLine($"extract: {Path.GetFileName(shardPath)}");
+        using var input = File.OpenRead(shardPath);
+        await using var reader = await ParquetReader.CreateAsync(input);
+        DataField textField = reader.Schema.GetDataFields().First(f => f.Name == "text");
+        using var writer = new StreamWriter(corpusPath, append: true,
+            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 1 << 20);
+        long docs = 0;
+        for (int rg = 0; rg < reader.RowGroupCount; rg++)
+        {
+            using var rowGroup = reader.OpenRowGroupReader(rg);
+            var rows = new string?[rowGroup.RowCount];
+            await rowGroup.ReadAsync(textField, rows);
+            foreach (string? text in rows)
+            {
+                if (!string.IsNullOrEmpty(text))
+                {
+                    writer.Write(text);
+                    writer.Write('\n');
+                    docs++;
+                }
+            }
+        }
+        return docs;
+    }
+
+    /// <summary>Reads the first up-to-<paramref name="limit"/> bytes, backing off to a newline.</summary>
+    private static byte[] ReadHead(string path, int limit)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
+        int n = (int)Math.Min(limit, fs.Length);
+        var buf = new byte[n];
+        int fill = 0;
+        while (fill < n)
+        {
+            int r = fs.Read(buf, fill, n - fill);
+            if (r == 0) break;
+            fill += r;
+        }
+        if (fs.Position < fs.Length)
+        {
+            int nl = Array.LastIndexOf(buf, (byte)'\n', fill - 1);
+            if (nl > 0) fill = nl + 1;
+        }
+        return buf.AsSpan(0, fill).ToArray();
+    }
+
+    /// <summary>Encodes the corpus in newline-aligned chunks, appending LE uint16 ids; returns token count.</summary>
+    private static long StreamEncode(BpeTokenizer tok, string corpusPath, string tmpBin, Stopwatch sw)
+    {
+        var buf = new byte[EncodeChunkSize];
+        var outBuf = new byte[EncodeChunkSize * 2]; // worst case: one token per byte
+        long tokens = 0, done = 0;
+        using var input = new FileStream(corpusPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+        using var output = new FileStream(tmpBin, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
+        long total = input.Length;
+        while (true)
+        {
+            int fill = 0;
+            while (fill < buf.Length)
+            {
+                int r = input.Read(buf, fill, buf.Length - fill);
+                if (r == 0) break;
+                fill += r;
+            }
+            if (fill == 0) break;
+
+            // more data follows: back off to the last newline so docs stay whole
+            int n = fill;
+            if (input.Position < total)
+            {
+                int nl = Array.LastIndexOf(buf, (byte)'\n', fill - 1);
+                if (nl > 0) n = nl + 1;
+            }
+
+            int[] ids = tok.Encode(buf.AsSpan(0, n));
+            for (int i = 0; i < ids.Length; i++)
+            {
+                outBuf[2 * i] = (byte)ids[i];
+                outBuf[2 * i + 1] = (byte)(ids[i] >> 8);
+            }
+            output.Write(outBuf, 0, ids.Length * 2);
+            tokens += ids.Length;
+            done += n;
+            if (n < fill) input.Seek(n - fill, SeekOrigin.Current);
+            Console.WriteLine($"encode: {done / 1e6:F0}/{total / 1e6:F0} MB " +
+                              $"({tokens:N0} tokens, {done / 1e6 / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):F1} MB/s)");
+        }
+        return tokens;
+    }
+
+    /// <summary>Splits a uint16 bin at a byte offset into train/val files.</summary>
+    private static void SplitBin(string src, long cutBytes, string trainPath, string valPath)
+    {
+        using var input = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+        var buf = new byte[8 << 20];
+        void CopyTo(string path, long bytes)
+        {
+            using var dst = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
+            long left = bytes;
+            while (left > 0)
+            {
+                int r = input.Read(buf, 0, (int)Math.Min(buf.Length, left));
+                if (r == 0) break;
+                dst.Write(buf, 0, r);
+                left -= r;
+            }
+        }
+        CopyTo(trainPath, cutBytes);
+        CopyTo(valPath, input.Length - cutBytes);
+    }
+}

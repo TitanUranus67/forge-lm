@@ -117,6 +117,37 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void DataLoader_MemoryMappedPathSamplesCorrectly()
+        {
+            string path = Path.GetTempFileName();
+            try
+            {
+                using (var bw = new BinaryWriter(File.Create(path)))
+                    for (int i = 0; i < 1000; i++) bw.Write((ushort)(i * 3 % 65536));
+
+                // inMemoryLimit: 0 forces the memory-mapped path even for a tiny file
+                using var loader = new DataLoader(path, inMemoryLimit: 0);
+                Check.True(loader.Length == 1000, $"Length {loader.Length} should be 1000");
+
+                var rng = new Random(7);
+                const int ctx = 8;
+                int[] inputs = new int[ctx], targets = new int[ctx];
+                for (int trial = 0; trial < 200; trial++)
+                {
+                    loader.Sample(rng, ctx, inputs, targets);
+                    int o = inputs[0] / 3; // ids[i] = i*3, all unique multiples of 3
+                    Check.True(inputs[0] % 3 == 0, $"offset id is a multiple of 3");
+                    for (int i = 0; i < ctx; i++)
+                    {
+                        Check.True(inputs[i] == (o + i) * 3 % 65536, $"inputs[{i}] follows ids[{o + i}]");
+                        Check.True(targets[i] == (o + i + 1) * 3 % 65536, $"targets[{i}] follows ids[{o + i + 1}]");
+                    }
+                }
+            }
+            finally { File.Delete(path); }
+        }
+
+        [Test]
         public static void Trainer_TrainLossDrops()
         {
             // Repetitive data: next token is fully predictable (i -> (i+1) mod 16).
@@ -155,6 +186,56 @@ namespace LLM.Core.Tests
                 Console.WriteLine($"    trainer loss {initial:F4} -> {summary.FinalTrainLoss:F4} " +
                                   $"(val {summary.FinalValLoss:F4}) in {sw.Elapsed.TotalSeconds:F1}s, {logs.Count} logs");
                 Check.True(sw.Elapsed.TotalSeconds < 15, $"trainer run should take <15s, took {sw.Elapsed.TotalSeconds:F1}s");
+            }
+            finally { File.Delete(path); }
+        }
+
+        private static string WriteRepetitiveTokens(int count)
+        {
+            string path = Path.GetTempFileName();
+            using (var bw = new BinaryWriter(File.Create(path)))
+                for (int i = 0; i < count; i++) bw.Write((ushort)(i % 16));
+            return path;
+        }
+
+        [Test]
+        public static void Trainer_ControlHookInvokedOncePerStep()
+        {
+            string path = WriteRepetitiveTokens(1024);
+            try
+            {
+                var train = new DataLoader(path);
+                var model = new GptModel(Small, B, new Random(3));
+                var opts = new TrainOptions { Steps = 10, WarmupSteps = 2, Seed = 1, LogEvery = 5 };
+
+                var seen = new List<int>();
+                TrainSummary summary = Trainer.Train(model, train, val: null, opts,
+                    controlHook: s => { seen.Add(s); return TrainCommand.Continue; });
+
+                Check.True(seen.Count == 10, $"hook called {seen.Count} times, expected 10");
+                for (int i = 0; i < seen.Count; i++)
+                    Check.True(seen[i] == i + 1, $"hook call {i} got step {seen[i]}, expected {i + 1}");
+                Check.True(summary.Steps == 10, $"summary.Steps {summary.Steps}, expected 10");
+            }
+            finally { File.Delete(path); }
+        }
+
+        [Test]
+        public static void Trainer_SaveAndQuitStopsEarly()
+        {
+            string path = WriteRepetitiveTokens(1024);
+            try
+            {
+                var train = new DataLoader(path);
+                var model = new GptModel(Small, B, new Random(3));
+                var opts = new TrainOptions { Steps = 20, WarmupSteps = 2, Seed = 1, LogEvery = 5 };
+
+                int calls = 0;
+                TrainSummary summary = Trainer.Train(model, train, val: null, opts,
+                    controlHook: s => { calls++; return s == 5 ? TrainCommand.SaveAndQuit : TrainCommand.Continue; });
+
+                Check.True(calls == 5, $"hook called {calls} times, expected 5");
+                Check.True(summary.Steps == 5, $"summary.Steps {summary.Steps}, expected 5");
             }
             finally { File.Delete(path); }
         }

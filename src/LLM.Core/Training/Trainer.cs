@@ -41,6 +41,15 @@ namespace LLM.Core.Training
     /// <summary>Returned by <see cref="Trainer.Train"/> when the run finishes.</summary>
     public sealed record TrainSummary(float FinalTrainLoss, float? FinalValLoss, int Steps, TimeSpan Elapsed);
 
+    /// <summary>Steering command returned by the control hook passed to <see cref="Trainer.Train"/>.</summary>
+    public enum TrainCommand
+    {
+        /// <summary>Keep training.</summary>
+        Continue,
+        /// <summary>Stop after the current step, exactly as if cancelled (the caller still saves).</summary>
+        SaveAndQuit,
+    }
+
     /// <summary>
     /// Batched training loop. Each step samples <see cref="TrainOptions.BatchSize"/>
     /// sequences of ContextLength tokens, stacks them row-wise into one [B*T, C]
@@ -59,11 +68,15 @@ namespace LLM.Core.Training
         /// model and completed-step count every <see cref="TrainOptions.SaveEvery"/>
         /// steps (never on the final step — the caller saves then). Cancelling
         /// <paramref name="cancel"/> stops after the current step; the summary's
-        /// Steps reflects how many steps actually ran.
+        /// Steps reflects how many steps actually ran. <paramref name="controlHook"/>
+        /// is invoked once per step (after the optimizer step, before logging) with
+        /// the 1-based step number; returning <see cref="TrainCommand.SaveAndQuit"/>
+        /// stops the run exactly like cancellation.
         /// </summary>
         public static TrainSummary Train(GptModel model, DataLoader train, DataLoader? val,
             TrainOptions opts, Action<TrainLog>? onLog = null,
-            Action<GptModel, int>? onSave = null, CancellationToken cancel = default)
+            Action<GptModel, int>? onSave = null, CancellationToken cancel = default,
+            Func<int, TrainCommand>? controlHook = null)
         {
             if (val is null && opts.ValEvery != 0)
                 throw new ArgumentException("ValEvery is set but no val DataLoader was given.", nameof(val));
@@ -72,10 +85,11 @@ namespace LLM.Core.Training
             int ctx = opts.ContextLength > 0 ? opts.ContextLength : model.Config.ContextLength;
             int batch = opts.BatchSize;
             var rng = new Random(opts.Seed);
-            var adam = new AdamW();
+            var adam = new AdamW(model.Backend);
             int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
             var sw = Stopwatch.StartNew();
+            bool prof = Environment.GetEnvironmentVariable("LLM_GPU_STATS") == "1";
 
             float lastTrain = 0f, lastVal = float.NaN;
             int stepsRun = 0;
@@ -90,11 +104,24 @@ namespace LLM.Core.Training
                     Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
                     Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
                 }
+                long p0 = prof ? Stopwatch.GetTimestamp() : 0;
                 model.Params.ZeroGrads();
+                long p1 = prof ? Stopwatch.GetTimestamp() : 0;
                 lastTrain = model.ForwardBackward(inputs, targets, batch);
-                ClipGradNorm(model.Params, opts.GradClip);
+                long p2 = prof ? Stopwatch.GetTimestamp() : 0;
+                ClipGradNorm(model.Params, model.Backend, opts.GradClip);
+                long p3 = prof ? Stopwatch.GetTimestamp() : 0;
                 adam.Step(model.Params, lr, weightDecay: opts.WeightDecay);
                 stepsRun = step + 1;
+                if (prof)
+                {
+                    long p4 = Stopwatch.GetTimestamp();
+                    double Ms(long a, long b) => (b - a) * 1000.0 / Stopwatch.Frequency;
+                    Console.Error.WriteLine($"[step {step + 1}] zero {Ms(p0, p1):F0}ms  fwdbwd {Ms(p1, p2):F0}ms  clip {Ms(p2, p3):F0}ms  adam {Ms(p3, p4):F0}ms");
+                    model.Backend.DumpStats($"step {step + 1}");
+                }
+
+                if (controlHook?.Invoke(step + 1) == TrainCommand.SaveAndQuit) break;
 
                 if (step == 0 || (step + 1) % opts.LogEvery == 0 || step + 1 == opts.Steps)
                 {
@@ -132,21 +159,17 @@ namespace LLM.Core.Training
         }
 
         /// <summary>Scales all gradients so the global L2 norm does not exceed maxNorm.</summary>
-        private static void ClipGradNorm(Parameters p, float maxNorm)
+        private static void ClipGradNorm(Parameters p, ITensorBackend backend, float maxNorm)
         {
             if (maxNorm <= 0f) return;
             double sumSq = 0;
             foreach (string name in p.Names)
-                foreach (float g in p.Grad(name).Data)
-                    sumSq += (double)g * g;
+                sumSq += backend.SumSquares(p.Grad(name)); // device-side reduction when supported
             float norm = MathF.Sqrt((float)sumSq);
             if (norm <= maxNorm || norm == 0f) return;
             float scale = maxNorm / norm;
             foreach (string name in p.Names)
-            {
-                Tensor g = p.Grad(name);
-                for (int i = 0; i < g.Length; i++) g.Data[i] *= scale;
-            }
+                backend.Scale(p.Grad(name), scale);
         }
     }
 }

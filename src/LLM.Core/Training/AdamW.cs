@@ -8,11 +8,22 @@ namespace LLM.Core.Training
     /// weight decay. First/second moment buffers are allocated lazily per parameter
     /// tensor on the first <see cref="Step"/> call. Following nanoGPT, weight decay
     /// is skipped for 1-D tensors (biases and LayerNorm gains).
+    /// With a backend attached, the update itself runs through
+    /// <see cref="ITensorBackend.AdamWStep"/> — fully on device for device backends,
+    /// with the moment buffers kept as device-resident tensors.
     /// </summary>
     public sealed class AdamW
     {
-        private readonly Dictionary<string, (float[] M, float[] V)> _state = new();
+        private readonly Dictionary<string, (Tensor M, Tensor V)> _state = new();
+        private readonly ITensorBackend? _backend;
         private int _t;
+
+        /// <summary>
+        /// Creates the optimizer. <paramref name="backend"/> runs the per-parameter
+        /// update (and keeps moment buffers device-resident for device backends);
+        /// pass null for host-only use.
+        /// </summary>
+        public AdamW(ITensorBackend? backend = null) => _backend = backend;
 
         /// <summary>Number of <see cref="Step"/> calls so far (drives bias correction).</summary>
         public int StepCount => _t;
@@ -37,7 +48,12 @@ namespace LLM.Core.Training
                 Tensor g = p.Grad(name);
                 if (!_state.TryGetValue(name, out var st))
                 {
-                    st = (new float[w.Length], new float[w.Length]);
+                    st = (new Tensor(w.Shape), new Tensor(w.Shape));
+                    if (_backend is not null)
+                    {
+                        _backend.Zero(st.M); // zero on device too: no zero-upload on first use
+                        _backend.Zero(st.V);
+                    }
                     _state.Add(name, st);
                 }
                 else if (st.M.Length != w.Length)
@@ -45,8 +61,14 @@ namespace LLM.Core.Training
                     throw new InvalidOperationException($"Parameter '{name}' changed shape between steps.");
                 }
 
+                if (_backend is not null)
+                {
+                    _backend.AdamWStep(w, g, st.M, st.V, lr, beta1, beta2, eps, weightDecay, _t);
+                    continue;
+                }
+
                 bool decay = weightDecay != 0f && w.Rank > 1;
-                float[] m = st.M, v = st.V;
+                float[] m = st.M.Data, v = st.V.Data;
                 for (int i = 0; i < w.Length; i++)
                 {
                     float gi = g.Data[i];

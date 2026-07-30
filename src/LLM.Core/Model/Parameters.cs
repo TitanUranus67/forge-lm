@@ -12,6 +12,14 @@ namespace LLM.Core.Model
     {
         private readonly Dictionary<string, (Tensor Weight, Tensor Grad)> _map = new();
         private readonly List<string> _names = new();
+        private readonly ITensorBackend? _backend;
+
+        /// <summary>
+        /// Creates an empty registry. <paramref name="backend"/> is used to keep device
+        /// caches coherent when gradients are zeroed (host-side write); pass null for
+        /// host-only use.
+        /// </summary>
+        public Parameters(ITensorBackend? backend = null) => _backend = backend;
 
         /// <summary>
         /// Registers a parameter: creates the weight tensor (zero-initialized; callers
@@ -41,10 +49,14 @@ namespace LLM.Core.Model
         /// <summary>Total number of scalar parameters across all tensors.</summary>
         public long Count => _map.Values.Sum(e => (long)e.Weight.Length);
 
-        /// <summary>Zeroes every gradient tensor.</summary>
+        /// <summary>Zeroes every gradient tensor (on device when the backend supports it).</summary>
         public void ZeroGrads()
         {
-            foreach (var (_, grad) in _map.Values) grad.Zero();
+            foreach (var (_, grad) in _map.Values)
+            {
+                if (_backend is not null) _backend.Zero(grad);
+                else grad.Zero();
+            }
         }
     }
 }

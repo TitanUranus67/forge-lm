@@ -31,7 +31,19 @@ public sealed class CpuBackend : ITensorBackend
     // ---- Matmul ------------------------------------------------------------
 
     /// <inheritdoc/>
-    public void MatMulNN(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate = false)
+    public void MatMulNN(Tensor a, Tensor b, Tensor y, int M, int K, int N, bool accumulate = false)
+        => MatMulNN(a.AsReadOnlySpan(), b.AsReadOnlySpan(), y.AsSpan(), M, K, N, accumulate);
+
+    /// <inheritdoc/>
+    public void MatMulTN(Tensor a, Tensor b, Tensor y, int M, int K, int N, bool accumulate = false)
+        => MatMulTN(a.AsReadOnlySpan(), b.AsReadOnlySpan(), y.AsSpan(), M, K, N, accumulate);
+
+    /// <inheritdoc/>
+    public void MatMulNT(Tensor a, Tensor b, Tensor y, int M, int K, int N, bool accumulate = false)
+        => MatMulNT(a.AsReadOnlySpan(), b.AsReadOnlySpan(), y.AsSpan(), M, K, N, accumulate);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void MatMulNN(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate)
     {
         if ((long)M * K * N <= SmallMatMulWork)
         {
@@ -41,8 +53,8 @@ public sealed class CpuBackend : ITensorBackend
         MatMulRowKernel(a, b, y, M, K, N, accumulate, aIsTransposed: false);
     }
 
-    /// <inheritdoc/>
-    public void MatMulTN(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate = false)
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void MatMulTN(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate)
     {
         if ((long)M * K * N <= SmallMatMulWork)
         {
@@ -52,8 +64,8 @@ public sealed class CpuBackend : ITensorBackend
         MatMulRowKernel(a, b, y, M, K, N, accumulate, aIsTransposed: true);
     }
 
-    /// <inheritdoc/>
-    public void MatMulNT(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate = false)
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void MatMulNT(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> y, int M, int K, int N, bool accumulate)
     {
         if ((long)M * K * N <= SmallMatMulWork)
         {
@@ -204,17 +216,81 @@ public sealed class CpuBackend : ITensorBackend
         return sum;
     }
 
+    // ---- Batched matmul (packed independent slots) --------------------------------
+
+    /// <inheritdoc/>
+    public void BatchedMatMulNN(Tensor a, Tensor b, Tensor y, int slots, int M, int K, int N, bool accumulate = false)
+    {
+        for (int s = 0; s < slots; s++)
+            MatMulNN(a.AsReadOnlySpan().Slice(s * M * K, M * K), b.AsReadOnlySpan().Slice(s * K * N, K * N),
+                y.AsSpan().Slice(s * M * N, M * N), M, K, N, accumulate);
+    }
+
+    /// <inheritdoc/>
+    public void BatchedMatMulNT(Tensor a, Tensor b, Tensor y, int slots, int M, int K, int N, bool accumulate = false)
+    {
+        for (int s = 0; s < slots; s++)
+            MatMulNT(a.AsReadOnlySpan().Slice(s * M * K, M * K), b.AsReadOnlySpan().Slice(s * N * K, N * K),
+                y.AsSpan().Slice(s * M * N, M * N), M, K, N, accumulate);
+    }
+
+    /// <inheritdoc/>
+    public void BatchedMatMulTN(Tensor a, Tensor b, Tensor y, int slots, int M, int K, int N, bool accumulate = false)
+    {
+        for (int s = 0; s < slots; s++)
+            MatMulTN(a.AsReadOnlySpan().Slice(s * K * M, K * M), b.AsReadOnlySpan().Slice(s * K * N, K * N),
+                y.AsSpan().Slice(s * M * N, M * N), M, K, N, accumulate);
+    }
+
+    // ---- Attention head packing -----------------------------------------------------
+
+    /// <inheritdoc/>
+    public void PackHeads(Tensor src, Tensor dst, int batch, int T, int nHeads, int headDim, int colBase)
+    {
+        int srcCols = src.Cols;
+        for (int seq = 0; seq < batch; seq++)
+            for (int h = 0; h < nHeads; h++)
+            {
+                int s = seq * nHeads + h;
+                for (int t = 0; t < T; t++)
+                    src.AsReadOnlySpan().Slice((seq * T + t) * srcCols + colBase + h * headDim, headDim)
+                        .CopyTo(dst.AsSpan().Slice((s * T + t) * headDim, headDim));
+            }
+    }
+
+    /// <inheritdoc/>
+    public void UnpackHeads(Tensor src, Tensor dst, int batch, int T, int nHeads, int headDim, int colBase)
+    {
+        int dstCols = dst.Cols;
+        for (int seq = 0; seq < batch; seq++)
+            for (int h = 0; h < nHeads; h++)
+            {
+                int s = seq * nHeads + h;
+                for (int t = 0; t < T; t++)
+                    src.AsReadOnlySpan().Slice((s * T + t) * headDim, headDim)
+                        .CopyTo(dst.AsSpan().Slice((seq * T + t) * dstCols + colBase + h * headDim, headDim));
+            }
+    }
+
     // ---- Elementwise / rows -------------------------------------------------
 
     /// <inheritdoc/>
-    public void AddBias(Span<float> y, ReadOnlySpan<float> bias, int rows, int cols)
+    public void AddBias(Tensor y, Tensor bias, int rows, int cols)
+        => AddBias(y.AsSpan(), bias.AsReadOnlySpan(), rows, cols);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void AddBias(Span<float> y, ReadOnlySpan<float> bias, int rows, int cols)
     {
         for (int r = 0; r < rows; r++)
             AddInPlace(y.Slice(r * cols, cols), bias);
     }
 
     /// <inheritdoc/>
-    public void SumRows(ReadOnlySpan<float> dY, Span<float> dBias, int rows, int cols)
+    public void SumRows(Tensor dY, Tensor dBias, int rows, int cols)
+        => SumRows(dY.AsReadOnlySpan(), dBias.AsSpan(), rows, cols);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void SumRows(ReadOnlySpan<float> dY, Span<float> dBias, int rows, int cols)
     {
         for (int r = 0; r < rows; r++)
         {
@@ -225,7 +301,11 @@ public sealed class CpuBackend : ITensorBackend
     }
 
     /// <inheritdoc/>
-    public void AddInPlace(Span<float> dst, ReadOnlySpan<float> src)
+    public void AddInPlace(Tensor dst, Tensor src)
+        => AddInPlace(dst.AsSpan(), src.AsReadOnlySpan());
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void AddInPlace(Span<float> dst, ReadOnlySpan<float> src)
     {
         int i = 0, w = Vector<float>.Count;
         for (; i <= dst.Length - w; i += w)
@@ -235,7 +315,24 @@ public sealed class CpuBackend : ITensorBackend
     }
 
     /// <inheritdoc/>
-    public void Scale(Span<float> x, float factor)
+    public void Copy(Tensor src, Tensor dst)
+        => src.AsReadOnlySpan().CopyTo(dst.AsSpan());
+
+    /// <inheritdoc/>
+    public void CopyBlock(Tensor src, Tensor dst, int srcRow, int srcCol, int dstRow, int dstCol, int rows, int cols)
+    {
+        int srcCols = src.Cols, dstCols = dst.Cols;
+        for (int r = 0; r < rows; r++)
+            src.AsReadOnlySpan().Slice((srcRow + r) * srcCols + srcCol, cols)
+                .CopyTo(dst.AsSpan().Slice((dstRow + r) * dstCols + dstCol, cols));
+    }
+
+    /// <inheritdoc/>
+    public void Scale(Tensor x, float factor)
+        => Scale(x.AsSpan(), factor);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void Scale(Span<float> x, float factor)
     {
         int i = 0, w = Vector<float>.Count;
         Vector<float> f = new(factor);
@@ -246,7 +343,11 @@ public sealed class CpuBackend : ITensorBackend
     }
 
     /// <inheritdoc/>
-    public void Transpose(ReadOnlySpan<float> x, Span<float> output, int rows, int cols)
+    public void Transpose(Tensor x, Tensor output, int rows, int cols)
+        => Transpose(x.AsReadOnlySpan(), output.AsSpan(), rows, cols);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void Transpose(ReadOnlySpan<float> x, Span<float> output, int rows, int cols)
     {
         for (int r = 0; r < rows; r++)
             for (int c = 0; c < cols; c++)
@@ -256,7 +357,21 @@ public sealed class CpuBackend : ITensorBackend
     // ---- LayerNorm -----------------------------------------------------------
 
     /// <inheritdoc/>
-    public void LayerNormForward(ReadOnlySpan<float> x, ReadOnlySpan<float> w, ReadOnlySpan<float> b,
+    public void LayerNormForward(Tensor x, Tensor w, Tensor b,
+        Tensor output, Tensor mean, Tensor rstd, int rows, int cols, float eps)
+        => LayerNormForward(x.AsReadOnlySpan(), w.AsReadOnlySpan(), b.AsReadOnlySpan(),
+            output.AsSpan(), mean.AsSpan(), rstd.AsSpan(), rows, cols, eps);
+
+    /// <inheritdoc/>
+    public void LayerNormBackward(Tensor dOut, Tensor x, Tensor w,
+        Tensor mean, Tensor rstd,
+        Tensor dX, Tensor dW, Tensor dB, int rows, int cols)
+        => LayerNormBackward(dOut.AsReadOnlySpan(), x.AsReadOnlySpan(), w.AsReadOnlySpan(),
+            mean.AsReadOnlySpan(), rstd.AsReadOnlySpan(),
+            dX.AsSpan(), dW.AsSpan(), dB.AsSpan(), rows, cols);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void LayerNormForward(ReadOnlySpan<float> x, ReadOnlySpan<float> w, ReadOnlySpan<float> b,
         Span<float> output, Span<float> mean, Span<float> rstd, int rows, int cols, float eps)
     {
         for (int r = 0; r < rows; r++)
@@ -279,8 +394,8 @@ public sealed class CpuBackend : ITensorBackend
         }
     }
 
-    /// <inheritdoc/>
-    public void LayerNormBackward(ReadOnlySpan<float> dOut, ReadOnlySpan<float> x, ReadOnlySpan<float> w,
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void LayerNormBackward(ReadOnlySpan<float> dOut, ReadOnlySpan<float> x, ReadOnlySpan<float> w,
         ReadOnlySpan<float> mean, ReadOnlySpan<float> rstd,
         Span<float> dX, Span<float> dW, Span<float> dB, int rows, int cols)
     {
@@ -317,7 +432,15 @@ public sealed class CpuBackend : ITensorBackend
     // ---- Softmax --------------------------------------------------------------
 
     /// <inheritdoc/>
-    public void SoftmaxForward(Span<float> x, int rows, int cols)
+    public void SoftmaxForward(Tensor x, int rows, int cols)
+        => SoftmaxForward(x.AsSpan(), rows, cols);
+
+    /// <inheritdoc/>
+    public void SoftmaxBackward(Tensor dOut, Tensor softmaxOut, Tensor dX, int rows, int cols)
+        => SoftmaxBackward(dOut.AsReadOnlySpan(), softmaxOut.AsReadOnlySpan(), dX.AsSpan(), rows, cols);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void SoftmaxForward(Span<float> x, int rows, int cols)
     {
         for (int r = 0; r < rows; r++)
         {
@@ -331,8 +454,8 @@ public sealed class CpuBackend : ITensorBackend
         }
     }
 
-    /// <inheritdoc/>
-    public void SoftmaxBackward(ReadOnlySpan<float> dOut, ReadOnlySpan<float> softmaxOut, Span<float> dX, int rows, int cols)
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void SoftmaxBackward(ReadOnlySpan<float> dOut, ReadOnlySpan<float> softmaxOut, Span<float> dX, int rows, int cols)
     {
         for (int r = 0; r < rows; r++)
         {
@@ -348,14 +471,22 @@ public sealed class CpuBackend : ITensorBackend
     // ---- GELU ------------------------------------------------------------------
 
     /// <inheritdoc/>
-    public void GeluForward(ReadOnlySpan<float> x, Span<float> output)
+    public void GeluForward(Tensor x, Tensor output)
+        => GeluForward(x.AsReadOnlySpan(), output.AsSpan());
+
+    /// <inheritdoc/>
+    public void GeluBackward(Tensor dOut, Tensor x, Tensor dX)
+        => GeluBackward(dOut.AsReadOnlySpan(), x.AsReadOnlySpan(), dX.AsSpan());
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void GeluForward(ReadOnlySpan<float> x, Span<float> output)
     {
         for (int i = 0; i < x.Length; i++)
             output[i] = Gelu(x[i]);
     }
 
-    /// <inheritdoc/>
-    public void GeluBackward(ReadOnlySpan<float> dOut, ReadOnlySpan<float> x, Span<float> dX)
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void GeluBackward(ReadOnlySpan<float> dOut, ReadOnlySpan<float> x, Span<float> dX)
     {
         for (int i = 0; i < x.Length; i++)
         {
@@ -367,6 +498,12 @@ public sealed class CpuBackend : ITensorBackend
         }
     }
 
+    /// <inheritdoc/>
+    public void InvalidateDeviceCache(Tensor t) { } // host-only backend: no device cache to invalidate
+
+    /// <inheritdoc/>
+    public void EnsureHostCurrent(Tensor t) { } // host-only backend: Data is always current
+
     private static float Gelu(float v)
     {
         float u = GeluC * (v + GeluCoeff * v * v * v);
@@ -376,14 +513,22 @@ public sealed class CpuBackend : ITensorBackend
     // ---- Embedding ---------------------------------------------------------------
 
     /// <inheritdoc/>
-    public void EmbeddingForward(ReadOnlySpan<float> table, ReadOnlySpan<int> indices, Span<float> output, int D)
+    public void EmbeddingForward(Tensor table, int[] indices, Tensor output, int D)
+        => EmbeddingForward(table.AsReadOnlySpan(), indices, output.AsSpan(), D);
+
+    /// <inheritdoc/>
+    public void EmbeddingBackward(Tensor dOut, int[] indices, Tensor dTable, int D)
+        => EmbeddingBackward(dOut.AsReadOnlySpan(), indices, dTable.AsSpan(), D);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void EmbeddingForward(ReadOnlySpan<float> table, int[] indices, Span<float> output, int D)
     {
         for (int t = 0; t < indices.Length; t++)
             table.Slice(indices[t] * D, D).CopyTo(output.Slice(t * D, D));
     }
 
-    /// <inheritdoc/>
-    public void EmbeddingBackward(ReadOnlySpan<float> dOut, ReadOnlySpan<int> indices, Span<float> dTable, int D)
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void EmbeddingBackward(ReadOnlySpan<float> dOut, int[] indices, Span<float> dTable, int D)
     {
         for (int t = 0; t < indices.Length; t++)
             AddInPlace(dTable.Slice(indices[t] * D, D), dOut.Slice(t * D, D));
@@ -392,17 +537,30 @@ public sealed class CpuBackend : ITensorBackend
     // ---- Attention helpers ---------------------------------------------------------
 
     /// <inheritdoc/>
-    public void CausalMask(Span<float> scores, int T)
+    public void CausalMask(Tensor scores, int T)
+        => CausalMask(scores.AsSpan(), T);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void CausalMask(Span<float> scores, int T)
     {
-        for (int i = 0; i < T; i++)
-            for (int j = i + 1; j < T; j++)
-                scores[i * T + j] = float.NegativeInfinity;
+        for (int o = 0; o < scores.Length; o += T * T)
+            for (int i = 0; i < T; i++)
+                for (int j = i + 1; j < T; j++)
+                    scores[o + i * T + j] = float.NegativeInfinity;
     }
 
     // ---- Cross-entropy --------------------------------------------------------------
 
     /// <inheritdoc/>
-    public float CrossEntropyForward(ReadOnlySpan<float> logits, ReadOnlySpan<int> targets, Span<float> probs, int T, int V, int ignoreIndex)
+    public float CrossEntropyForward(Tensor logits, int[] targets, Tensor probs, int T, int V, int ignoreIndex)
+        => CrossEntropyForward(logits.AsReadOnlySpan(), targets, probs.AsSpan(), T, V, ignoreIndex);
+
+    /// <inheritdoc/>
+    public void CrossEntropyBackward(Tensor probs, int[] targets, Tensor dLogits, int T, int V, int ignoreIndex)
+        => CrossEntropyBackward(probs.AsReadOnlySpan(), targets, dLogits.AsSpan(), T, V, ignoreIndex);
+
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static float CrossEntropyForward(ReadOnlySpan<float> logits, int[] targets, Span<float> probs, int T, int V, int ignoreIndex)
     {
         float totalLoss = 0f;
         int count = 0;
@@ -411,6 +569,9 @@ public sealed class CpuBackend : ITensorBackend
             ReadOnlySpan<float> logitRow = logits.Slice(t * V, V);
             Span<float> probRow = probs.Slice(t * V, V);
 
+            // probs may alias logits (in-place softmax): capture the target logit before any writes.
+            bool ignored = targets[t] == ignoreIndex;
+            float targetLogit = ignored ? 0f : logitRow[targets[t]];
             float max = logitRow[0];
             for (int v = 1; v < V; v++) max = MathF.Max(max, logitRow[v]);
             float sum = 0f;
@@ -418,17 +579,17 @@ public sealed class CpuBackend : ITensorBackend
             float inv = 1f / sum;
             for (int v = 0; v < V; v++) probRow[v] *= inv;
 
-            if (targets[t] != ignoreIndex)
+            if (!ignored)
             {
-                totalLoss += MathF.Log(sum) + max - logitRow[targets[t]]; // -log softmax, stable
+                totalLoss += MathF.Log(sum) + max - targetLogit; // -log softmax, stable
                 count++;
             }
         }
         return count > 0 ? totalLoss / count : 0f;
     }
 
-    /// <inheritdoc/>
-    public void CrossEntropyBackward(ReadOnlySpan<float> probs, ReadOnlySpan<int> targets, Span<float> dLogits, int T, int V, int ignoreIndex)
+    /// <summary>Span twin of the public kernel; the body operates purely on spans.</summary>
+    private static void CrossEntropyBackward(ReadOnlySpan<float> probs, int[] targets, Span<float> dLogits, int T, int V, int ignoreIndex)
     {
         int count = 0;
         for (int t = 0; t < T; t++)

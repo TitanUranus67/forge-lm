@@ -30,7 +30,6 @@ namespace LLM.Core.Model
 
         // caches for Backward
         private int[]? _lastTokens;
-        private Tensor? _logits;
 
         // cached positional indices for the batched path: [0..T) repeated B times
         private int[]? _batchPositions;
@@ -40,7 +39,7 @@ namespace LLM.Core.Model
         {
             Config = config;
             _b = backend;
-            var p = new Parameters();
+            var p = new Parameters(backend);
             int d = config.DModel;
             float std = 0.02f;
             float residStd = 0.02f / MathF.Sqrt(2f * config.NLayers); // GPT-2 residual-projection init
@@ -99,6 +98,9 @@ namespace LLM.Core.Model
         /// <summary>Named parameter registry (weights + gradients), in registration order.</summary>
         public Parameters Params { get; }
 
+        /// <summary>The tensor backend this model runs on.</summary>
+        public ITensorBackend Backend => _b;
+
         /// <summary>Model hyperparameters.</summary>
         public ModelConfig Config { get; }
 
@@ -109,7 +111,9 @@ namespace LLM.Core.Model
         public Tensor Forward(IReadOnlyList<int> tokens)
         {
             int[] toks = ValidateTokens(tokens);
-            return ForwardCore(toks, batch: 1);
+            Tensor logits = ForwardCore(toks, batch: 1);
+            _b.EnsureHostCurrent(logits); // callers read logits.Data directly
+            return logits;
         }
 
         /// <summary>
@@ -171,11 +175,10 @@ namespace LLM.Core.Model
             int t = tokens.Length / batch;
 
             Tensor x = _tokEmb.Forward(tokens);
-            _b.AddInPlace(x.Data, _posEmb.Forward(BatchPositions(batch, t)).Data);
+            _b.AddInPlace(x, _posEmb.Forward(BatchPositions(batch, t)));
             foreach (TransformerBlock block in _blocks)
                 x = block.Forward(x, batch);
-            _logits = _head.Forward(_lnF.Forward(x));
-            return _logits;
+            return _head.Forward(_lnF.Forward(x)); // logits; NOT cached — training consumes them immediately
         }
 
         /// <summary>Batched training step: forward, mean cross-entropy over all B*T positions, backward.</summary>
@@ -184,10 +187,15 @@ namespace LLM.Core.Model
             Tensor logits = ForwardCore(inputs, batch);
             int rows = logits.Shape[0], v = Config.VocabSize;
 
-            var probs = new Tensor(rows, v);
-            float loss = _b.CrossEntropyForward(logits.Data, targets, probs.Data, rows, v, IgnoreIndex);
-            var dLogits = new Tensor(rows, v);
-            _b.CrossEntropyBackward(probs.Data, targets, dLogits.Data, rows, v, IgnoreIndex);
+            // Alias everything onto the logits buffer: it is dead after the CE forward
+            // (backward uses the LN-cached x, not y), and at 16k vocab each [rows,v]
+            // tensor is ~266 MB — two extra copies would blow the 8 GB VRAM budget.
+            // Both CE kernels are row read-then-write and elementwise respectively,
+            // so in-place aliasing is safe.
+            Tensor probs = logits;
+            float loss = _b.CrossEntropyForward(logits, targets, probs, rows, v, IgnoreIndex);
+            Tensor dLogits = logits;
+            _b.CrossEntropyBackward(probs, targets, dLogits, rows, v, IgnoreIndex);
             Backward(dLogits);
             return loss;
         }
