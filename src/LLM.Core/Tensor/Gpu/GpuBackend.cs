@@ -49,16 +49,25 @@ namespace LLM.Core.Tensor.Gpu
         //  - Tensors are managed-tiny, so the GC does not recycle them fast enough
         //    on its own and weak-ref reclaim starves (each step would carve a fresh
         //    ~6 GB working set and page). Every allocation miss therefore forces a
-        //    full GC and reclaims chunks of collected tensors eagerly; free chunks
-        //    are reused exact-fit or split best-fit, and training repeats the same
-        //    activation sizes every step, so steady state performs no device
-        //    allocations at all.
+        //    collection (gen 0 first — per-step activations die young; a full GC is
+        //    only the backstop) and reclaims chunks of collected tensors eagerly.
+        //
+        // Fragmentation control: requests are rounded UP to size buckets (see
+        // BucketOf) and free lists are keyed by bucket, so a freed chunk is
+        // reusable for any request landing in the same bucket. Training repeats
+        // the same activation sizes every step, so after a short warm-up Rent is
+        // a free-list hit ~100% of the time, carves stop, and committed device
+        // memory stays flat instead of creeping. Chunks are never split: a miss
+        // may take the smallest larger free bucket within 4x whole instead.
         private readonly Dictionary<int, Stack<Chunk>> _freeChunks = new();
         private readonly List<(WeakReference<Tensor> Owner, Entry Entry)> _entries = new();
         private readonly List<ReadWriteBuffer<float>> _deviceBuffers = new();
         private ReadWriteBuffer<float>? _arena;
         private int _arenaUsed;
         private bool _disposed;
+
+        // cumulative allocator diagnostics (free-list hit vs fresh device carve)
+        private long _allocHits, _allocCarves;
 
         // device scratch for the embedding-backward CAS pass (bit-cast of a float tensor)
         private ReadWriteBuffer<int>? _scatterBits;
@@ -112,12 +121,33 @@ namespace LLM.Core.Tensor.Gpu
         /// <summary>Dedicated video memory in bytes.</summary>
         public long DeviceMemoryBytes => (long)_device.DedicatedMemorySize;
 
+        /// <summary>Total bytes of live device buffers (arenas + dedicated). Diagnostic.</summary>
+        public long CommittedBytes
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    long bytes = 0;
+                    foreach (ReadWriteBuffer<float> b in _deviceBuffers) bytes += b.Length * 4L;
+                    return bytes;
+                }
+            }
+        }
+
+        /// <summary>Cumulative free-list hits vs fresh device carves since creation. Diagnostic.</summary>
+        public (long Hits, long Carves) AllocStats
+        {
+            get { lock (_gate) return (_allocHits, _allocCarves); }
+        }
+
         // ---- profiling (enabled with LLM_GPU_STATS=1) --------------------------------
         private readonly bool _prof = Environment.GetEnvironmentVariable("LLM_GPU_STATS") == "1";
         private readonly Dictionary<string, (long Count, double Ms)> _profOps = new();
         private double _profUpMs, _profDownMs, _profGcMs, _profRentMs;
         private long _profUpBytes, _profDownBytes;
         private int _profGcCount, _profCarves, _profReclaims;
+        private long _profHits;
 
         private void RecOp(string op, long t0)
         {
@@ -136,7 +166,7 @@ namespace LLM.Core.Tensor.Gpu
                 long devBytes = 0;
                 foreach (ReadWriteBuffer<float> b in _deviceBuffers) devBytes += b.Length * 4L;
                 Console.Error.WriteLine($"[gpu:{tag}] up {_profUpBytes / 1e6:F0}MB/{_profUpMs:F0}ms  down {_profDownBytes / 1e6:F0}MB/{_profDownMs:F0}ms  " +
-                    $"GCs {_profGcCount} ({_profGcMs:F0}ms)  rent {_profRentMs:F0}ms  carves {_profCarves}  reclaims {_profReclaims}  " +
+                    $"GCs {_profGcCount} ({_profGcMs:F0}ms)  rent {_profRentMs:F0}ms  hits {_profHits}  carves {_profCarves}  reclaims {_profReclaims}  " +
                     $"heap {GC.GetTotalMemory(false) / 1e6:F0}MB  dev {devBytes / 1e6:F0}MB/{_deviceBuffers.Count}buf");
                 foreach (KeyValuePair<string, (long Count, double Ms)> kv in _profOps.OrderByDescending(kv => kv.Value.Ms))
                     Console.Error.WriteLine($"    {kv.Key,-24} x{kv.Value.Count,-5} {kv.Value.Ms,10:F1}ms");
@@ -144,6 +174,7 @@ namespace LLM.Core.Tensor.Gpu
                 _profUpMs = _profDownMs = _profGcMs = _profRentMs = 0;
                 _profUpBytes = _profDownBytes = 0;
                 _profGcCount = _profCarves = _profReclaims = 0;
+                _profHits = 0;
             }
         }
 
@@ -153,19 +184,30 @@ namespace LLM.Core.Tensor.Gpu
         private Chunk Rent(int length)
         {
             long t0 = _prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            if (TryFree(length, out Chunk c)) return c;
+            int bucket = BucketOf(length);
+            if (TryFree(bucket, out Chunk c)) return Hit(c);
             ReclaimDeadEntries();
-            if (TryFree(length, out c)) return c;
+            if (TryFree(bucket, out c)) return Hit(c);
             // Tensors are managed-tiny, so natural GC does not collect dead ones in time
             // and weak-ref reclaim starves (each step would carve a fresh ~6 GB working
-            // set and page). Forcing a collection on every allocation miss keeps device
-            // memory within one working set; the heap stays small so each GC is cheap.
+            // set and page). Per-step activations die young, so a gen-0 collection
+            // usually uncovers them; the full GC is only the backstop. In steady state
+            // this fires about once per step (the first miss drains the dead entries of
+            // the previous step), never per allocation.
             var swg = _prof ? System.Diagnostics.Stopwatch.StartNew() : null;
+            GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+            ReclaimDeadEntries();
+            if (TryFree(bucket, out c))
+            {
+                if (swg is not null) { _profGcMs += swg.Elapsed.TotalMilliseconds; _profGcCount++; }
+                return Hit(c);
+            }
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
             if (swg is not null) { _profGcMs += swg.Elapsed.TotalMilliseconds; _profGcCount++; }
             ReclaimDeadEntries();
-            if (TryFree(length, out c)) return c;
-            Chunk carved = Carve(length);
+            if (TryFree(bucket, out c)) return Hit(c);
+            Chunk carved = Carve(bucket);
+            _allocCarves++;
             if (_prof)
             {
                 _profCarves++;
@@ -174,36 +216,55 @@ namespace LLM.Core.Tensor.Gpu
             return carved;
         }
 
-        private bool TryFree(int length, out Chunk chunk)
+        private Chunk Hit(Chunk c)
         {
-            // exact match first
-            if (_freeChunks.TryGetValue(length, out Stack<Chunk>? stack) && stack.Count > 0)
+            _allocHits++;
+            if (_prof) _profHits++;
+            return c;
+        }
+
+        /// <summary>
+        /// Allocation granularity: requests round UP to a bucket so freed chunks are
+        /// reusable across different tensor sizes. At or below 1024 floats the bucket
+        /// is the plain 16-float alignment (waste &lt;= 15 floats); above, buckets grow
+        /// geometrically at 1.25x (16-aligned), capping waste at ~25% while ~60
+        /// buckets cover every request up to 2^31 floats. All buckets are multiples
+        /// of 16, so arena offsets stay 16-aligned without extra padding.
+        /// </summary>
+        private static int BucketOf(int length)
+        {
+            if (length <= 1024) return (length + 15) & ~15;
+            long bucket = 1024;
+            while (bucket < length)
+            {
+                long next = bucket + (bucket >> 2);
+                if (next > int.MaxValue) break;
+                bucket = next;
+            }
+            if (bucket < length) bucket = length; // huge request: exact, 16-aligned below
+            return (int)((bucket + 15) & ~15L);
+        }
+
+        private bool TryFree(int bucket, out Chunk chunk)
+        {
+            // exact bucket match first
+            if (_freeChunks.TryGetValue(bucket, out Stack<Chunk>? stack) && stack.Count > 0)
             {
                 chunk = stack.Pop();
                 return true;
             }
-            // best fit within 4x: carve the request out of the smallest larger free chunk
+            // no splitting (arenas stay whole): take the smallest larger free bucket
+            // within 4x whole, if one exists
             int bestLen = -1;
             foreach (KeyValuePair<int, Stack<Chunk>> kv in _freeChunks)
-                if (kv.Value.Count > 0 && kv.Key >= length && kv.Key <= length * 4L && (bestLen < 0 || kv.Key < bestLen))
+                if (kv.Value.Count > 0 && kv.Key >= bucket && kv.Key <= bucket * 4L && (bestLen < 0 || kv.Key < bestLen))
                     bestLen = kv.Key;
             if (bestLen < 0)
             {
                 chunk = default;
                 return false;
             }
-            Chunk found = _freeChunks[bestLen].Pop();
-            int aligned = (length + 15) & ~15;
-            int remainder = bestLen - aligned;
-            if (remainder >= MinSplitFloats)
-            {
-                PushFree(new Chunk(found.Buf, found.Off + aligned, remainder));
-                chunk = new Chunk(found.Buf, found.Off, aligned);
-            }
-            else
-            {
-                chunk = found; // take the whole chunk; its true length is preserved for reuse
-            }
+            chunk = _freeChunks[bestLen].Pop();
             return true;
         }
 
@@ -214,22 +275,24 @@ namespace LLM.Core.Tensor.Gpu
             stack.Push(chunk);
         }
 
-        /// <summary>Remainders smaller than this (256 KB) are not worth splitting off.</summary>
+        /// <summary>Old-arena tails smaller than this (256 KB) are stranded, not recycled.</summary>
         private const int MinSplitFloats = 64 * 1024;
 
         /// <summary>Allocates fresh device storage: dedicated buffer when large, arena carve otherwise.</summary>
-        private Chunk Carve(int length)
+        private Chunk Carve(int bucket)
         {
-            if (length >= DedicatedFloats)
-                return new Chunk(AllocDeviceBuffer(length), 0, length);
-            int aligned = (length + 15) & ~15;
-            if (_arena is null || _arenaUsed + aligned > _arena.Length)
+            if (bucket >= DedicatedFloats)
+                return new Chunk(AllocDeviceBuffer(bucket), 0, bucket);
+            if (_arena is null || _arenaUsed + bucket > _arena.Length)
             {
-                _arena = AllocDeviceBuffer(Math.Max(ArenaFloats, aligned));
+                // recycle the old arena's tail as a free chunk instead of stranding it
+                if (_arena is not null && _arena.Length - _arenaUsed >= MinSplitFloats)
+                    PushFree(new Chunk(_arena, _arenaUsed, BucketOf(_arena.Length - _arenaUsed)));
+                _arena = AllocDeviceBuffer(Math.Max(ArenaFloats, bucket));
                 _arenaUsed = 0;
             }
-            var chunk = new Chunk(_arena, _arenaUsed, length);
-            _arenaUsed += aligned;
+            var chunk = new Chunk(_arena, _arenaUsed, bucket);
+            _arenaUsed += bucket;
             return chunk;
         }
 

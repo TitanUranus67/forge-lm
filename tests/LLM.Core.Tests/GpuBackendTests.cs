@@ -632,5 +632,71 @@ namespace LLM.Core.Tests
                 $"GPU overfit: loss {initial:F3} -> {final:F3}, expected final < {0.2f * initial:F3}");
             Console.WriteLine($"    GPU overfit loss {initial:F4} -> {final:F4} after 200 SGD steps");
         }
+
+        // ---------- allocator ------------------------------------------------------
+
+        /// <summary>
+        /// Fragmentation plateau: emulates the per-step allocate/drop pattern of
+        /// training (a fixed set of ~30 varied-size temporaries per iteration, all
+        /// references dropped at iteration end, plus a few persistent tensors during
+        /// warm-up). After warm-up the allocator must serve every rent from its free
+        /// lists: zero new device buffers, so committed memory stays flat, and the
+        /// free-list hit rate must exceed 95%. Sized to ~64 MB/iteration so the test
+        /// coexists with other work on a shared GPU. Uses a private backend (not the
+        /// shared <see cref="Gpu"/>) so committed-bytes accounting is isolated.
+        /// </summary>
+        [Test]
+        public static void Allocator_SteadyStatePlateau()
+        {
+            if (Skip()) return;
+            using var gpu = new GpuBackend();
+
+            // ~64 MB per iteration, shaped like a step's forward/backward temporaries
+            int[] sizes =
+            {
+                786432, 786432, 786432, 786432,       // 4 x 3.0 MB
+                393216, 393216, 393216, 393216, 393216, 393216, // 6 x 1.5 MB
+                196608, 196608, 196608, 196608, 196608, 196608, // 6 x 0.75 MB
+                98304, 98304, 98304, 98304, 98304, 98304,       // 6 x 0.375 MB
+                3145728, 3145728,                     // 2 x 12 MB
+                1572864, 1572864,                     // 2 x 6 MB
+                2048, 2048, 2048, 2048, 768, 768,     // small (biases, LN stats)
+            };
+
+            const int Warmup = 30, Iters = 200;
+            var persistent = new List<Tensor>();
+            long committedWarm = 0;
+            long hitsWarm = 0, carvesWarm = 0;
+            for (int it = 0; it < Iters; it++)
+            {
+                foreach (int n in sizes)
+                {
+                    var t = new Tensor(n);
+                    gpu.Zero(t); // rents device storage for t
+                } // all temporaries become garbage here; the allocator reclaims them
+                if (it < Warmup && it % 5 == 0) // occasional persistent allocation
+                {
+                    var keep = new Tensor(50000);
+                    gpu.Zero(keep); // rent device storage that survives the whole run
+                    persistent.Add(keep);
+                }
+                if (it == Warmup - 1)
+                {
+                    committedWarm = gpu.CommittedBytes;
+                    (hitsWarm, carvesWarm) = gpu.AllocStats;
+                }
+            }
+
+            long committedEnd = gpu.CommittedBytes;
+            (long hitsEnd, long carvesEnd) = gpu.AllocStats;
+            long hits = hitsEnd - hitsWarm, carves = carvesEnd - carvesWarm;
+            double hitRate = (double)hits / (hits + carves);
+            Console.WriteLine($"    allocator: committed {committedWarm / 1e6:F0}MB @iter{Warmup} -> {committedEnd / 1e6:F0}MB @iter{Iters}, " +
+                $"steady-state hits {hits} carves {carves} ({hitRate:P1} hit)");
+            Check.True(committedWarm > 0, "warm-up committed memory is nonzero");
+            Check.True(committedEnd == committedWarm,
+                $"committed device memory grew after warm-up: {committedWarm / 1e6:F0}MB -> {committedEnd / 1e6:F0}MB");
+            Check.True(hitRate > 0.95, $"steady-state free-list hit rate {hitRate:P1} > 95%");
+        }
     }
 }
