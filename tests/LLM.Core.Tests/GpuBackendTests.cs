@@ -639,11 +639,14 @@ namespace LLM.Core.Tests
         /// Fragmentation plateau: emulates the per-step allocate/drop pattern of
         /// training (a fixed set of ~30 varied-size temporaries per iteration, all
         /// references dropped at iteration end, plus a few persistent tensors during
-        /// warm-up). After warm-up the allocator must serve every rent from its free
-        /// lists: zero new device buffers, so committed memory stays flat, and the
-        /// free-list hit rate must exceed 95%. Sized to ~64 MB/iteration so the test
-        /// coexists with other work on a shared GPU. Uses a private backend (not the
-        /// shared <see cref="Gpu"/>) so committed-bytes accounting is isolated.
+        /// warm-up). Sizes carry a deterministic ±12% per-step jitter (period 10)
+        /// emulating shape drift; an exact-size allocator would fragment here, while
+        /// bucketed free lists keep reusing the same chunks. After warm-up the
+        /// allocator must serve every rent from its free lists: zero new device
+        /// buffers, so committed memory stays flat, and the free-list hit rate must
+        /// exceed 95%. Sized to ~64 MB/iteration so the test coexists with other
+        /// work on a shared GPU. Uses a private backend (not the shared
+        /// <see cref="Gpu"/>) so committed-bytes accounting is isolated.
         /// </summary>
         [Test]
         public static void Allocator_SteadyStatePlateau()
@@ -669,8 +672,11 @@ namespace LLM.Core.Tests
             long hitsWarm = 0, carvesWarm = 0;
             for (int it = 0; it < Iters; it++)
             {
-                foreach (int n in sizes)
+                for (int i = 0; i < sizes.Length; i++)
                 {
+                    // deterministic per-step drift, +-12.5% with period 10 (fully
+                    // covered by the warm-up, so steady state repeats exactly)
+                    int n = sizes[i] + sizes[i] * (((it + i) % 10) - 5) / 40;
                     var t = new Tensor(n);
                     gpu.Zero(t); // rents device storage for t
                 } // all temporaries become garbage here; the allocator reclaims them
