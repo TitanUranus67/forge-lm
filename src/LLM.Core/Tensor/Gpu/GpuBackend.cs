@@ -231,18 +231,18 @@ namespace LLM.Core.Tensor.Gpu
         /// buckets cover every request up to 2^31 floats. All buckets are multiples
         /// of 16, so arena offsets stay 16-aligned without extra padding.
         /// </summary>
-        private static int BucketOf(int length)
+        internal static int BucketOf(int length)
         {
             if (length <= 1024) return (length + 15) & ~15;
+            // Geometric 1.25x series with 16-alignment FOLDED INTO the rungs, so every
+            // bucket size is itself a series member and therefore a fixed point of this
+            // function (free lists are keyed by bucket; non-fixed-point sizes would be
+            // re-bucketed upward and leak past the space they claim — see Carve).
             long bucket = 1024;
             while (bucket < length)
-            {
-                long next = bucket + (bucket >> 2);
-                if (next > int.MaxValue) break;
-                bucket = next;
-            }
-            if (bucket < length) bucket = length; // huge request: exact, 16-aligned below
-            return (int)((bucket + 15) & ~15L);
+                bucket = (bucket + (bucket >> 2) + 15) & ~15L;
+            if (bucket > int.MaxValue) return (length + 15) & ~15; // huge request: exact, aligned
+            return (int)bucket;
         }
 
         private bool TryFree(int bucket, out Chunk chunk)
@@ -285,9 +285,17 @@ namespace LLM.Core.Tensor.Gpu
                 return new Chunk(AllocDeviceBuffer(bucket), 0, bucket);
             if (_arena is null || _arenaUsed + bucket > _arena.Length)
             {
-                // recycle the old arena's tail as a free chunk instead of stranding it
-                if (_arena is not null && _arena.Length - _arenaUsed >= MinSplitFloats)
-                    PushFree(new Chunk(_arena, _arenaUsed, BucketOf(_arena.Length - _arenaUsed)));
+                // recycle the old arena's tail as a free chunk instead of stranding it.
+                // The tail must be floored to a true bucket size (a fixed point of
+                // BucketOf) — BucketOf rounds UP, which would let the chunk claim
+                // space past the end of the arena.
+                if (_arena is not null)
+                {
+                    int tail = (_arena.Length - _arenaUsed) & ~15;
+                    while (tail > 0 && BucketOf(tail) != tail) tail -= 16;
+                    if (tail >= MinSplitFloats)
+                        PushFree(new Chunk(_arena, _arenaUsed, tail));
+                }
                 _arena = AllocDeviceBuffer(Math.Max(ArenaFloats, bucket));
                 _arenaUsed = 0;
             }

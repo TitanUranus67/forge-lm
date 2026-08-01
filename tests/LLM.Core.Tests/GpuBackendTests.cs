@@ -379,6 +379,29 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void BucketOf_IdempotentAlignedAndBounded()
+        {
+            // Bucket sizes must be fixed points of BucketOf: free lists are keyed by
+            // bucket, and recycled arena tails are floored to a fixed point. A bucket
+            // that rounds up past itself would let a chunk claim space it doesn't own
+            // (regression: arena-tail recycling overflowed the arena at 110M scale).
+            Check.True(GpuBackend.BucketOf(1) == 16, "min bucket is 16");
+            var rng = new Random(7);
+            for (int i = 1; i <= 100000; i++)
+            {
+                int x = i <= 5000 ? i : rng.Next(1, 1 << 28);
+                int b = GpuBackend.BucketOf(x);
+                Check.True(b >= x, $"bucket {b} >= request {x}");
+                Check.True((b & 15) == 0, $"bucket {b} is 16-aligned");
+                Check.True(GpuBackend.BucketOf(b) == b, $"bucket {b} is a fixed point of BucketOf");
+                if (x > 1024)
+                    Check.True(b <= (long)(x * 1.25) + 31, $"waste bounded for {x} -> {b}");
+                else
+                    Check.True(b - x <= 15, $"small-request waste <= 15 for {x} -> {b}");
+            }
+        }
+
+        [Test]
         public static void CrossEntropy_AliasedInPlaceMatchesCpu()
         {
             if (Skip()) return;
