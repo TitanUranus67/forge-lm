@@ -232,6 +232,56 @@ namespace LLM.Core.Tests
             finally { File.Delete(path); }
         }
 
+        [Test]
+        public static void GradientAccumulation_MatchesEquivalentLargeBatch()
+        {
+            string path = WriteRepetitiveTokens(2048);
+            try
+            {
+                var accumulated = new GptModel(Small, B, new Random(23));
+                var largeBatch = new GptModel(Small, B, new Random(23));
+                var accumulatedOptions = new TrainOptions
+                {
+                    Steps = 2,
+                    MaxLr = 1e-3f,
+                    MinLr = 1e-4f,
+                    WarmupSteps = 0,
+                    WeightDecay = 0f,
+                    GradClip = 0f,
+                    ContextLength = Small.ContextLength,
+                    BatchSize = 2,
+                    AccumulationSteps = 2,
+                    Seed = 222,
+                    LogEvery = 1,
+                    ValEvery = 0,
+                };
+                TrainCommand StopAfterOne(int step) =>
+                    step == 1 ? TrainCommand.SaveAndQuit : TrainCommand.Continue;
+
+                TrainingState accumulatedState = TrainingState.CreateNew(B, accumulatedOptions);
+                using (var data = new DataLoader(path))
+                    Trainer.Train(accumulated, data, val: null, accumulatedOptions,
+                        controlHook: StopAfterOne, state: accumulatedState);
+
+                TrainOptions largeBatchOptions = accumulatedOptions with
+                {
+                    BatchSize = 4,
+                    AccumulationSteps = 1,
+                };
+                TrainingState largeBatchState = TrainingState.CreateNew(B, largeBatchOptions);
+                using (var data = new DataLoader(path))
+                    Trainer.Train(largeBatch, data, val: null, largeBatchOptions,
+                        controlHook: StopAfterOne, state: largeBatchState);
+
+                foreach (string name in accumulated.Params.Names)
+                    Check.SpanNear(accumulated.Params.Weight(name).Data, largeBatch.Params.Weight(name).Data,
+                        2e-5f, $"{name}: accumulation equals one equivalent large batch");
+                Check.True(accumulatedState.GlobalStep == 1, "one accumulated optimizer update");
+                Check.True(accumulatedState.Optimizer.StepCount == 1, "Adam advances once per accumulated update");
+            }
+            finally { File.Delete(path); }
+        }
+
         private static string WriteRepetitiveTokens(int count)
         {
             string path = Path.GetTempFileName();

@@ -23,6 +23,8 @@ namespace LLM.Core.Training
         public int ContextLength { get; init; }
         /// <summary>Sequences per optimizer step (true batching: one [B*T, C] pass per step).</summary>
         public int BatchSize { get; init; } = 8;
+        /// <summary>Physical batches accumulated and averaged before one optimizer update.</summary>
+        public int AccumulationSteps { get; init; } = 1;
         /// <summary>RNG seed for data sampling (and therefore reproducibility).</summary>
         public int Seed { get; init; } = 1337;
         /// <summary>Emit a log record every this many steps.</summary>
@@ -53,11 +55,11 @@ namespace LLM.Core.Training
     }
 
     /// <summary>
-    /// Batched training loop. Each step samples <see cref="TrainOptions.BatchSize"/>
-    /// sequences of ContextLength tokens, stacks them row-wise into one [B*T, C]
-    /// pass (loss and gradients are the mean over all B*T positions), clips the
-    /// global gradient norm, and applies one AdamW update on the warmup+cosine
-    /// learning-rate schedule.
+    /// Batched training loop. Each optimizer step runs
+    /// <see cref="TrainOptions.AccumulationSteps"/> physical batches of
+    /// <see cref="TrainOptions.BatchSize"/> sequences, averages their gradients,
+    /// clips the global norm once, and applies one AdamW update on the
+    /// warmup+cosine learning-rate schedule.
     /// </summary>
     public static class Trainer
     {
@@ -85,10 +87,13 @@ namespace LLM.Core.Training
                 throw new ArgumentException("ValEvery is set but no val DataLoader was given.", nameof(val));
             if (opts.BatchSize < 1)
                 throw new ArgumentException("BatchSize must be >= 1.", nameof(opts));
+            if (opts.AccumulationSteps < 1)
+                throw new ArgumentException("AccumulationSteps must be >= 1.", nameof(opts));
             if (opts.ValBatches < 1)
                 throw new ArgumentException("ValBatches must be >= 1.", nameof(opts));
             int ctx = opts.ContextLength > 0 ? opts.ContextLength : model.Config.ContextLength;
             int batch = opts.BatchSize;
+            int accumulation = opts.AccumulationSteps;
             state ??= TrainingState.CreateNew(model.Backend, opts);
             state.RequireCompatible(opts);
             TrainingRandom rng = state.DataRandom;
@@ -105,16 +110,23 @@ namespace LLM.Core.Training
                 if (cancel.IsCancellationRequested) break;
                 float lr = LrSchedule.GetLr(step, opts.Steps, opts.MaxLr, opts.MinLr, opts.WarmupSteps);
 
-                for (int b = 0; b < batch; b++)
-                {
-                    train.Sample(rng, ctx, seqInputs, seqTargets);
-                    Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
-                    Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
-                }
                 long p0 = prof ? Stopwatch.GetTimestamp() : 0;
                 model.Params.ZeroGrads();
                 long p1 = prof ? Stopwatch.GetTimestamp() : 0;
-                lastTrain = model.ForwardBackward(inputs, targets, batch);
+                double trainLossSum = 0;
+                for (int microStep = 0; microStep < accumulation; microStep++)
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        train.Sample(rng, ctx, seqInputs, seqTargets);
+                        Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
+                        Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
+                    }
+                    trainLossSum += model.ForwardBackward(inputs, targets, batch);
+                }
+                lastTrain = (float)(trainLossSum / accumulation);
+                if (accumulation > 1)
+                    ScaleGradients(model.Params, model.Backend, 1f / accumulation);
                 long p2 = prof ? Stopwatch.GetTimestamp() : 0;
                 ClipGradNorm(model.Params, model.Backend, opts.GradClip);
                 long p3 = prof ? Stopwatch.GetTimestamp() : 0;
@@ -186,6 +198,12 @@ namespace LLM.Core.Training
             float norm = MathF.Sqrt((float)sumSq);
             if (norm <= maxNorm || norm == 0f) return;
             float scale = maxNorm / norm;
+            foreach (string name in p.Names)
+                backend.Scale(p.Grad(name), scale);
+        }
+
+        private static void ScaleGradients(Parameters p, ITensorBackend backend, float scale)
+        {
             foreach (string name in p.Names)
                 backend.Scale(p.Grad(name), scale);
         }

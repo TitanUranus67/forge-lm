@@ -11,6 +11,7 @@ namespace LLM.Core.Training
         float WeightDecay,
         float GradClip,
         int BatchSize,
+        int AccumulationSteps,
         int ContextLength);
 
     /// <summary>
@@ -45,6 +46,7 @@ namespace LLM.Core.Training
             options.WeightDecay,
             options.GradClip,
             options.BatchSize,
+            options.AccumulationSteps,
             options.ContextLength);
 
         internal void RequireCompatible(TrainOptions options)
@@ -61,6 +63,7 @@ namespace LLM.Core.Training
 
         private static string Describe(TrainingConfiguration c) =>
             $"steps={c.TotalSteps}, lr={c.MaxLr:G9}, minlr={c.MinLr:G9}, warmup={c.WarmupSteps}, " +
-            $"wd={c.WeightDecay:G9}, gradclip={c.GradClip:G9}, batch={c.BatchSize}, ctx={c.ContextLength}";
+            $"wd={c.WeightDecay:G9}, gradclip={c.GradClip:G9}, batch={c.BatchSize}, " +
+            $"accum={c.AccumulationSteps}, ctx={c.ContextLength}";
     }
 }

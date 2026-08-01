@@ -41,6 +41,7 @@ namespace LLM.Core.Checkpoint
             public float WeightDecay { get; set; }
             public float GradClip { get; set; }
             public int BatchSize { get; set; }
+            public int AccumulationSteps { get; set; }
             public int TrainingContextLength { get; set; }
         }
 
@@ -80,6 +81,7 @@ namespace LLM.Core.Checkpoint
                 WeightDecay = c.WeightDecay,
                 GradClip = c.GradClip,
                 BatchSize = c.BatchSize,
+                AccumulationSteps = c.AccumulationSteps,
                 TrainingContextLength = c.ContextLength,
             };
 
@@ -211,7 +213,8 @@ namespace LLM.Core.Checkpoint
             optimizer.RestoreState(model.Params, t.AdamStep, entries);
 
             var trainingConfig = new TrainingConfiguration(t.TotalSteps, t.MaxLr, t.MinLr,
-                t.WarmupSteps, t.WeightDecay, t.GradClip, t.BatchSize, t.TrainingContextLength);
+                t.WarmupSteps, t.WeightDecay, t.GradClip, t.BatchSize,
+                Math.Max(1, t.AccumulationSteps), t.TrainingContextLength);
             var rng = new TrainingRandom(t.DataRngState, t.DataRngIncrement);
             var state = new TrainingState(t.GlobalStep, optimizer, rng, trainingConfig);
             return new LoadedTrainingCheckpoint(model, state);

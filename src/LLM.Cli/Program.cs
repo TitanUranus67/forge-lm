@@ -53,8 +53,9 @@ internal static partial class Cli
         Usage:
           llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
           llm prepare-fineweb --out <dir> [--shards 10] [--merges 16000] [--toktrainmb 200]
-          llm train     --data <dir> [--steps 5000] [--dmodel 128] [--layers 4] [--heads 4]
-                        [--ctx 128] [--batch 8] [--lr 6e-4] [--minlr 6e-5] [--warmup 100] [--wd 0.1]
+          llm train     --data <dir> [--steps 5000 | --tokens N] [--dmodel 128] [--layers 4] [--heads 4]
+                        [--ctx 128] [--batch 8] [--accum 16] [--lr 6e-4] [--minlr 6e-5]
+                        [--warmup 100 | --warmup-tokens N] [--wd 0.1]
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
                         [--valbatches 50] [--valseed 424242]
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
@@ -207,7 +208,8 @@ internal static partial class Cli
 
                   Trains a GPT on the tokenizer.json + train.bin/val.bin produced by
                   `prepare`, and writes a checkpoint to --out (default out/model.bin).
-                  Each optimizer step processes --batch sequences (default 8) at once.
+                  Each physical pass processes --batch sequences (default 8); --accum
+                  physical passes are averaged into each optimizer update (default 16).
                   --init resumes a V2 training checkpoint exactly (model, Adam, global
                   step, LR schedule, and sampler RNG). V1 checkpoints contain weights
                   only; --resume-step N can supply their known cumulative scheduler
@@ -215,20 +217,26 @@ internal static partial class Cli
                   when loading. --saveevery N writes the checkpoint every N global
                   steps. --backend gpu runs training on the default D3D12 device.
                   Ctrl+C stops after the current step and still saves.
+                  --accum N averages N physical batches before each Adam/LR step.
+                  --tokens and --warmup-tokens convert token budgets into optimizer
+                  update counts using batch * context * accumulation.
                 """);
             return 0;
         }
 
         string dataDir = p.Require("data");
         int? stepsArg = p.GetInt("steps");
+        long? tokensArg = p.GetLong("tokens");
         int dmodel = p.GetInt("dmodel", 128);
         int layers = p.GetInt("layers", 4);
         int heads = p.GetInt("heads", 4);
         int ctx = p.GetInt("ctx", 128);
         int? batchArg = p.GetInt("batch");
+        int? accumulationArg = p.GetInt("accum");
         float? lrArg = p.GetFloat("lr");
         float? minlrArg = p.GetFloat("minlr");
         int? warmupArg = p.GetInt("warmup");
+        long? warmupTokensArg = p.GetLong("warmup-tokens");
         float? wdArg = p.GetFloat("wd");
         float? gradclipArg = p.GetFloat("gradclip");
         int seed = p.GetInt("seed", 42);
@@ -242,6 +250,11 @@ internal static partial class Cli
         int saveevery = p.GetInt("saveevery", 0);
         string backendName = p.Get("backend", "cpu");
         p.Done();
+
+        if (stepsArg is not null && tokensArg is not null)
+            throw new ArgumentException("Use either --steps or --tokens, not both.");
+        if (warmupArg is not null && warmupTokensArg is not null)
+            throw new ArgumentException("Use either --warmup or --warmup-tokens, not both.");
 
         ITensorBackend backend = CreateBackend(backendName);
         GptModel model;
@@ -276,19 +289,29 @@ internal static partial class Cli
             throw new ArgumentException("--resume-step requires --init with a legacy V1 weights-only checkpoint.");
 
         TrainingConfiguration? stored = trainState?.Configuration;
-        int steps = stepsArg ?? stored?.TotalSteps ?? 5000;
         int batch = batchArg ?? stored?.BatchSize ?? 8;
+        int accumulation = accumulationArg ?? stored?.AccumulationSteps ?? 16;
+        if (batch < 1) throw new ArgumentException("--batch must be >= 1.");
+        if (accumulation < 1) throw new ArgumentException("--accum must be >= 1.");
+        long tokensPerUpdate = checked((long)batch * model.Config.ContextLength * accumulation);
+        int steps = tokensArg is long tokenBudget
+            ? UpdatesForTokens(tokenBudget, tokensPerUpdate, "--tokens")
+            : stepsArg ?? stored?.TotalSteps ?? 5000;
         float lr = lrArg ?? stored?.MaxLr ?? 6e-4f;
         float minlr = minlrArg ?? stored?.MinLr ?? 6e-5f;
-        int warmup = warmupArg ?? stored?.WarmupSteps ?? 100;
+        int warmup = warmupTokensArg is long warmupTokenBudget
+            ? UpdatesForTokens(warmupTokenBudget, tokensPerUpdate, "--warmup-tokens")
+            : warmupArg ?? stored?.WarmupSteps ?? 100;
         float wd = wdArg ?? stored?.WeightDecay ?? 0.1f;
         float gradclip = gradclipArg ?? stored?.GradClip ?? 1.0f;
 
         var trainLoader = new DataLoader(Path.Combine(dataDir, "train.bin"));
         var valLoader = new DataLoader(Path.Combine(dataDir, "val.bin"));
         Console.WriteLine($"data: {trainLoader.Length:N0} train tokens, {valLoader.Length:N0} val tokens");
-        Console.WriteLine($"training: batch {batch} x {model.Config.ContextLength} ctx " +
-                          $"({batch * (double)model.Config.ContextLength:N0} tokens/step)");
+        long physicalBatchTokens = (long)batch * model.Config.ContextLength;
+        Console.WriteLine($"training: microbatch {batch} x {model.Config.ContextLength} ctx " +
+                          $"({physicalBatchTokens:N0} tokens), accumulation {accumulation} " +
+                          $"({tokensPerUpdate:N0} tokens/optimizer update)");
 
         var opts = new TrainOptions
         {
@@ -300,6 +323,7 @@ internal static partial class Cli
             GradClip = gradclip,
             ContextLength = model.Config.ContextLength,
             BatchSize = batch,
+            AccumulationSteps = accumulation,
             Seed = seed,
             LogEvery = logevery,
             ValEvery = valevery,
@@ -310,7 +334,7 @@ internal static partial class Cli
 
         trainState ??= TrainingState.CreateNew(backend, opts, resumeStep);
 
-        var display = new TrainDisplay(steps, model.Config.ContextLength * batch, trainState.GlobalStep);
+        var display = new TrainDisplay(steps, checked((int)tokensPerUpdate), trainState.GlobalStep);
 
         string? outDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
         if (outDir is not null) Directory.CreateDirectory(outDir);
@@ -504,6 +528,15 @@ internal static partial class Cli
 
     // ---- helpers -------------------------------------------------------------
 
+    private static int UpdatesForTokens(long tokens, long tokensPerUpdate, string flag)
+    {
+        if (tokens <= 0) throw new ArgumentException($"{flag} must be positive.");
+        long updates = checked((tokens + tokensPerUpdate - 1) / tokensPerUpdate);
+        if (updates > int.MaxValue)
+            throw new ArgumentException($"{flag} requires {updates:N0} optimizer updates, above the supported limit.");
+        return (int)updates;
+    }
+
     private static void WriteIds(string path, ReadOnlySpan<int> ids)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
@@ -555,6 +588,9 @@ internal static partial class Cli
 
         public int? GetInt(string key) =>
             Take(key) is string v ? int.Parse(v, CultureInfo.InvariantCulture) : null;
+
+        public long? GetLong(string key) =>
+            Take(key) is string v ? long.Parse(v, CultureInfo.InvariantCulture) : null;
 
         public float GetFloat(string key, float fallback) =>
             Take(key) is string v ? float.Parse(v, CultureInfo.InvariantCulture) : fallback;

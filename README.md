@@ -61,9 +61,13 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   chunks — a multi-GB corpus never has to fit in memory. Encoding is the slow
   phase (tens of minutes to hours depending on merges/corpus size); progress in
   MB is printed per chunk.
-- `train` runs a batched training loop: each optimizer step processes `--batch N`
-  sequences (default 8) at once as `[B*T, C]` tensors, with warmup + cosine LR
-  decay, gradient clipping, and periodic validation loss. Validation is the
+- `train` runs a batched training loop. Each physical `[B*T, C]` pass contains
+  `--batch N` sequences (default 8); the CLI defaults to `--accum 16`, averaging
+  16 physical-batch gradients before clipping and one Adam/LR update. `--tokens`
+  and `--warmup-tokens` convert desired token budgets to optimizer-update counts,
+  preventing accumulation from silently multiplying total corpus exposure or
+  warmup length. Training uses warmup + cosine LR decay and periodic validation.
+  Validation is the
   forward-only mean over 50 deterministic physical-size batches by default
   (`--valbatches`/`--valseed`), evaluated in microbatches so it does not raise
   peak VRAM or perturb the training sampler. On an interactive
@@ -95,8 +99,9 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   processed with batched kernels. Inference runs one sequence at a time; there
   is no KV cache.
 - **Training** (`Training/`) — AdamW (decoupled weight decay on 2-D params),
-  linear-warmup + cosine-decay LR schedule, global gradient-norm clipping, and
-  a random-offset data loader over raw uint16 token files.
+  averaged gradient accumulation, linear-warmup + cosine-decay in optimizer-update
+  units, global gradient-norm clipping, and a checkpointable random-offset data
+  loader over raw uint16 token files.
 - **CPU backend** (`Tensor/CpuBackend.cs`) — all math through an
   `ITensorBackend` interface; the CPU implementation uses `Vector<T>` SIMD in
   the matmul inner loops. Large matmuls parallelize over output rows with
