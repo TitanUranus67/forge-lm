@@ -63,7 +63,10 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   MB is printed per chunk.
 - `train` runs a batched training loop: each optimizer step processes `--batch N`
   sequences (default 8) at once as `[B*T, C]` tensors, with warmup + cosine LR
-  decay, gradient clipping, and periodic validation loss. On an interactive
+  decay, gradient clipping, and periodic validation loss. Validation is the
+  forward-only mean over 50 deterministic physical-size batches by default
+  (`--valbatches`/`--valseed`), evaluated in microbatches so it does not raise
+  peak VRAM or perturb the training sampler. On an interactive
   console an in-place progress bar shows percent, step, loss, rolling tok/s,
   ETA and elapsed time (it falls back to plain log lines when output is piped);
   pressing `p` pauses (resume, save+resume, or save+quit). Checkpoints are written

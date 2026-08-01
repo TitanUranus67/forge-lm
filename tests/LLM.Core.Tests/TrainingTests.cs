@@ -171,6 +171,7 @@ namespace LLM.Core.Tests
                     Seed = 123,
                     LogEvery = 50,
                     ValEvery = 100,
+                    ValBatches = 2,
                 };
 
                 var logs = new List<TrainLog>();
@@ -186,6 +187,47 @@ namespace LLM.Core.Tests
                 Console.WriteLine($"    trainer loss {initial:F4} -> {summary.FinalTrainLoss:F4} " +
                                   $"(val {summary.FinalValLoss:F4}) in {sw.Elapsed.TotalSeconds:F1}s, {logs.Count} logs");
                 Check.True(sw.Elapsed.TotalSeconds < 15, $"trainer run should take <15s, took {sw.Elapsed.TotalSeconds:F1}s");
+            }
+            finally { File.Delete(path); }
+        }
+
+        [Test]
+        public static void Validation_DoesNotPerturbTrainingTrajectory()
+        {
+            string path = WriteRepetitiveTokens(2048);
+            try
+            {
+                var withoutValidation = new GptModel(Small, B, new Random(17));
+                var withValidation = new GptModel(Small, B, new Random(17));
+                var baseOptions = new TrainOptions
+                {
+                    Steps = 4,
+                    MaxLr = 1e-3f,
+                    MinLr = 1e-4f,
+                    WarmupSteps = 1,
+                    ContextLength = Small.ContextLength,
+                    BatchSize = 2,
+                    Seed = 81,
+                    LogEvery = 1,
+                    ValEvery = 0,
+                    ValBatches = 3,
+                    ValSeed = 1234,
+                };
+
+                using (var train = new DataLoader(path))
+                    Trainer.Train(withoutValidation, train, val: null, baseOptions);
+                using (var train = new DataLoader(path))
+                using (var val = new DataLoader(path))
+                    Trainer.Train(withValidation, train, val, baseOptions with { ValEvery = 1 });
+
+                foreach (string name in withoutValidation.Params.Names)
+                {
+                    float[] expected = withoutValidation.Params.Weight(name).Data;
+                    float[] actual = withValidation.Params.Weight(name).Data;
+                    for (int i = 0; i < expected.Length; i++)
+                        Check.True(BitConverter.SingleToInt32Bits(actual[i]) == BitConverter.SingleToInt32Bits(expected[i]),
+                            $"{name}[{i}] unchanged by validation sampling");
+                }
             }
             finally { File.Delete(path); }
         }

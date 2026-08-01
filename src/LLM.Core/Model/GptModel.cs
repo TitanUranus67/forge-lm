@@ -141,6 +141,27 @@ namespace LLM.Core.Model
         /// </summary>
         public float ForwardBackward(int[] inputs, int[] targets, int batch)
         {
+            ValidateBatch(inputs, targets, batch);
+            return ForwardBackwardCore(ValidateTokenIds(inputs), ValidateTargets(targets), batch);
+        }
+
+        /// <summary>
+        /// Forward-only mean cross-entropy for a flattened batch. This follows the
+        /// same numerical path as <see cref="ForwardBackward(int[],int[],int)"/> but
+        /// does not calculate or modify parameter gradients.
+        /// </summary>
+        public float EvaluateLoss(int[] inputs, int[] targets, int batch)
+        {
+            ValidateBatch(inputs, targets, batch);
+            int[] validInputs = ValidateTokenIds(inputs);
+            int[] validTargets = ValidateTargets(targets);
+            Tensor logits = ForwardCore(validInputs, batch);
+            int rows = logits.Shape[0], v = Config.VocabSize;
+            return _b.CrossEntropyForward(logits, validTargets, logits, rows, v, IgnoreIndex);
+        }
+
+        private void ValidateBatch(int[] inputs, int[] targets, int batch)
+        {
             if (batch < 1)
                 throw new ArgumentOutOfRangeException(nameof(batch), "batch must be >= 1.");
             if (inputs.Length != targets.Length)
@@ -152,7 +173,6 @@ namespace LLM.Core.Model
                 throw new ArgumentException("Need at least one token per sequence.");
             if (t > Config.ContextLength)
                 throw new ArgumentException($"Sequence length {t} exceeds ContextLength {Config.ContextLength}.");
-            return ForwardBackwardCore(ValidateTokenIds(inputs), ValidateTargets(targets), batch);
         }
 
         /// <summary>

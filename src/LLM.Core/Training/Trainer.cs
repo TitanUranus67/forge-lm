@@ -29,8 +29,10 @@ namespace LLM.Core.Training
         public int LogEvery { get; init; } = 50;
         /// <summary>Evaluate validation loss every this many steps; 0 disables it.</summary>
         public int ValEvery { get; init; } = 0;
-        /// <summary>Number of val sequences averaged per evaluation.</summary>
-        public int ValSamples { get; init; } = 5;
+        /// <summary>Number of deterministic physical-size val batches averaged per evaluation.</summary>
+        public int ValBatches { get; init; } = 50;
+        /// <summary>Seed defining the fixed validation sample set (independent of training RNG).</summary>
+        public int ValSeed { get; init; } = 424242;
         /// <summary>Invoke the save callback every this many steps; 0 disables it.</summary>
         public int SaveEvery { get; init; } = 0;
     }
@@ -62,8 +64,9 @@ namespace LLM.Core.Training
         /// <summary>
         /// Trains <paramref name="model"/> in place. <paramref name="onLog"/> is
         /// invoked at step 0 and then every <see cref="TrainOptions.LogEvery"/>
-        /// steps; a val loss (averaged over <see cref="TrainOptions.ValSamples"/>
-        /// sequences) is included every <see cref="TrainOptions.ValEvery"/> steps
+        /// steps; a val loss (averaged over a fixed set of
+        /// <see cref="TrainOptions.ValBatches"/> physical-size batches) is included
+        /// every <see cref="TrainOptions.ValEvery"/> steps
         /// when a val loader is given. <paramref name="onSave"/> is invoked with the
         /// model and complete resumable state every <see cref="TrainOptions.SaveEvery"/>
         /// steps (never on the final step — the caller saves then). Cancelling
@@ -82,6 +85,8 @@ namespace LLM.Core.Training
                 throw new ArgumentException("ValEvery is set but no val DataLoader was given.", nameof(val));
             if (opts.BatchSize < 1)
                 throw new ArgumentException("BatchSize must be >= 1.", nameof(opts));
+            if (opts.ValBatches < 1)
+                throw new ArgumentException("ValBatches must be >= 1.", nameof(opts));
             int ctx = opts.ContextLength > 0 ? opts.ContextLength : model.Config.ContextLength;
             int batch = opts.BatchSize;
             state ??= TrainingState.CreateNew(model.Backend, opts);
@@ -132,7 +137,7 @@ namespace LLM.Core.Training
                     if (val is not null && opts.ValEvery > 0 &&
                         (step == 0 || (step + 1) % opts.ValEvery == 0 || step + 1 == opts.Steps))
                     {
-                        valLoss = EvalLoss(model, val, rng, ctx, opts.ValSamples);
+                        valLoss = EvalLoss(model, val, ctx, batch, opts.ValBatches, opts.ValSeed);
                         lastVal = valLoss.Value;
                     }
                     onLog?.Invoke(new TrainLog(step + 1, lr, lastTrain, valLoss, sw.Elapsed));
@@ -145,20 +150,30 @@ namespace LLM.Core.Training
             return new TrainSummary(lastTrain, float.IsNaN(lastVal) ? null : lastVal, stepsRun, sw.Elapsed);
         }
 
-        /// <summary>Mean loss of one batch of <paramref name="samples"/> random sequences; leaves grads dirty.</summary>
-        private static float EvalLoss(GptModel model, DataLoader data, TrainingRandom rng, int ctx, int samples)
+        /// <summary>
+        /// Forward-only mean over a fixed validation set. Batches are evaluated one at
+        /// a time so increasing sample count does not increase peak activation memory.
+        /// A fresh dedicated RNG makes every evaluation directly comparable and keeps
+        /// validation from perturbing the training sampler trajectory.
+        /// </summary>
+        private static float EvalLoss(GptModel model, DataLoader data, int ctx, int batch,
+            int valBatches, int valSeed)
         {
-            int[] inputs = new int[samples * ctx], targets = new int[samples * ctx];
+            var rng = new TrainingRandom(valSeed);
+            int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
-            for (int b = 0; b < samples; b++)
+            double lossSum = 0;
+            for (int evalBatch = 0; evalBatch < valBatches; evalBatch++)
             {
-                data.Sample(rng, ctx, seqInputs, seqTargets);
-                Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
-                Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
+                for (int b = 0; b < batch; b++)
+                {
+                    data.Sample(rng, ctx, seqInputs, seqTargets);
+                    Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
+                    Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
+                }
+                lossSum += model.EvaluateLoss(inputs, targets, batch);
             }
-            model.Params.ZeroGrads();
-            // mean over all samples*ctx positions == mean of per-sequence means (equal lengths)
-            return model.ForwardBackward(inputs, targets, samples);
+            return (float)(lossSum / valBatches);
         }
 
         /// <summary>Scales all gradients so the global L2 norm does not exceed maxNorm.</summary>

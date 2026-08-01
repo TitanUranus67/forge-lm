@@ -56,6 +56,7 @@ internal static partial class Cli
           llm train     --data <dir> [--steps 5000] [--dmodel 128] [--layers 4] [--heads 4]
                         [--ctx 128] [--batch 8] [--lr 6e-4] [--minlr 6e-5] [--warmup 100] [--wd 0.1]
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
+                        [--valbatches 50] [--valseed 424242]
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
                         [--resume-step N] [--backend cpu|gpu]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
@@ -233,6 +234,8 @@ internal static partial class Cli
         int seed = p.GetInt("seed", 42);
         int logevery = p.GetInt("logevery", 10);
         int valevery = p.GetInt("valevery", 250);
+        int valbatches = p.GetInt("valbatches", 50);
+        int valseed = p.GetInt("valseed", 424242);
         string outPath = p.Get("out", Path.Combine("out", "model.bin"));
         string? init = p.Get("init");
         int resumeStep = p.GetInt("resume-step", 0);
@@ -300,6 +303,8 @@ internal static partial class Cli
             Seed = seed,
             LogEvery = logevery,
             ValEvery = valevery,
+            ValBatches = valbatches,
+            ValSeed = valseed,
             SaveEvery = saveevery,
         };
 

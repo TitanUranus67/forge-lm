@@ -172,6 +172,7 @@ namespace LLM.Core.Tests
                     Seed = 123,
                     LogEvery = 50,
                     ValEvery = 100,
+                    ValBatches = 2,
                 };
 
                 var logs = new List<TrainLog>();
