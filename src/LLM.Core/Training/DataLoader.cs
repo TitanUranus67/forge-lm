@@ -61,11 +61,29 @@ public sealed class DataLoader : IDisposable
     /// </summary>
     public void Sample(Random rng, int contextLength, int[] inputs, int[] targets)
     {
+        ValidateSampleArguments(contextLength, inputs, targets);
+        FillSample(rng.Next((int)(_length - contextLength)), contextLength, inputs, targets);
+    }
+
+    /// <summary>
+    /// Checkpointable equivalent of <see cref="Sample(Random,int,int[],int[])"/> used by training.
+    /// </summary>
+    public void Sample(TrainingRandom rng, int contextLength, int[] inputs, int[] targets)
+    {
+        ValidateSampleArguments(contextLength, inputs, targets);
+        FillSample(rng.Next((int)(_length - contextLength)), contextLength, inputs, targets);
+    }
+
+    private void ValidateSampleArguments(int contextLength, int[] inputs, int[] targets)
+    {
         if (inputs.Length != contextLength || targets.Length != contextLength)
             throw new ArgumentException("inputs and targets must both have length contextLength.");
         if (_length < contextLength + 1)
             throw new ArgumentException($"Not enough tokens ({_length}) for context length {contextLength}.");
-        int o = rng.Next((int)(_length - contextLength));
+    }
+
+    private void FillSample(int o, int contextLength, int[] inputs, int[] targets)
+    {
         if (_ids is not null)
         {
             for (int i = 0; i < contextLength; i++)

@@ -68,8 +68,11 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   ETA and elapsed time (it falls back to plain log lines when output is piped);
   pressing `p` pauses (resume, save+resume, or save+quit). Checkpoints are written
   at the end, every `--saveevery N` steps, and on Ctrl+C (the run finishes its
-  current step, then saves) — an interrupted run is never lost. `--init` resumes
-  from a checkpoint.
+  current step, then saves) — an interrupted run is never lost. New V2 training
+  checkpoints preserve the global step, Adam moments, LR schedule, and sampler RNG,
+  so `--init` continues the same trajectory instead of restarting warmup. Legacy V1
+  model-only checkpoints still load; `--resume-step` can provide their known global
+  scheduler position during the one-time upgrade.
 - `generate` loads a checkpoint and samples autoregressively with temperature
   and top-k filtering.
 - `chat` is an interactive REPL over a checkpoint: each line you type is appended
@@ -111,9 +114,10 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   authoritative until `EnsureHostCurrent`), and host-side writes (optimizer,
   gradient clipping, checkpoint load) must call `InvalidateDeviceCache`.
   Measured at GPT-1 scale (dmodel 768, 12 layers, ctx 512, batch 8): see below.
-- **Checkpoints** (`Checkpoint/Checkpoint.cs`) — custom binary format:
-  `LLMSCRATCH1` magic, a JSON header (model config + parameter names), then raw
-  little-endian float32 weights. Loading validates everything and fails loud.
+- **Checkpoints** (`Checkpoint/Checkpoint.cs`) — versioned custom binary format.
+  `LLMSCRATCH1` is the legacy model-only format. `LLMSCRATCH2` adds cumulative step,
+  schedule/configuration, sampler RNG, Adam age, and first/second moment tensors to
+  the model weights. Loading validates the exact payload size and parameter registry.
   Checkpoints are backend-agnostic: train on GPU, generate on CPU or vice versa.
 
 ## GPU backend notes

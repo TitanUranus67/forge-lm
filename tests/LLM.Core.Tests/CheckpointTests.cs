@@ -4,6 +4,7 @@ namespace LLM.Core.Tests
     using LLM.Core.Checkpoint;
     using LLM.Core.Model;
     using LLM.Core.Tensor;
+    using LLM.Core.Training;
     using Tensor = LLM.Core.Tensor.Tensor;
 
     /// <summary>
@@ -44,6 +45,71 @@ namespace LLM.Core.Tests
                 Check.SpanNear(after.Data, before.Data, 0f, "logits identical after round-trip");
             }
             finally { File.Delete(path); }
+        }
+
+        [Test]
+        public static void TrainingCheckpoint_ResumeMatchesUninterruptedRun()
+        {
+            string dataPath = Path.GetTempFileName();
+            string checkpointPath = Path.GetTempFileName();
+            try
+            {
+                using (var bw = new BinaryWriter(File.Create(dataPath)))
+                    for (int i = 0; i < 2048; i++) bw.Write((ushort)(i % Small.VocabSize));
+
+                var opts = new TrainOptions
+                {
+                    Steps = 6,
+                    MaxLr = 1e-3f,
+                    MinLr = 1e-4f,
+                    WarmupSteps = 2,
+                    WeightDecay = 0.1f,
+                    GradClip = 1f,
+                    ContextLength = Small.ContextLength,
+                    BatchSize = 2,
+                    Seed = 99,
+                    LogEvery = 1,
+                    ValEvery = 0,
+                };
+
+                var uninterrupted = new GptModel(Small, B, new Random(42));
+                using (var data = new DataLoader(dataPath))
+                    Trainer.Train(uninterrupted, data, val: null, opts);
+
+                var interrupted = new GptModel(Small, B, new Random(42));
+                TrainingState state = TrainingState.CreateNew(B, opts);
+                using (var data = new DataLoader(dataPath))
+                    Trainer.Train(interrupted, data, val: null, opts,
+                        controlHook: step => step == 3 ? TrainCommand.SaveAndQuit : TrainCommand.Continue,
+                        state: state);
+                Checkpoint.SaveTraining(interrupted, state, checkpointPath);
+
+                Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(checkpointPath, B);
+                Check.True(loaded.TrainingState is not null, "V2 checkpoint restores training state");
+                Check.True(loaded.TrainingState!.GlobalStep == 3, "global step round-trips");
+                Check.True(loaded.TrainingState.Optimizer.StepCount == 3, "Adam age round-trips");
+                using (var data = new DataLoader(dataPath))
+                    Trainer.Train(loaded.Model, data, val: null, opts, state: loaded.TrainingState);
+
+                foreach (string name in uninterrupted.Params.Names)
+                {
+                    float[] expected = uninterrupted.Params.Weight(name).Data;
+                    float[] actual = loaded.Model.Params.Weight(name).Data;
+                    for (int i = 0; i < expected.Length; i++)
+                        Check.True(BitConverter.SingleToInt32Bits(actual[i]) == BitConverter.SingleToInt32Bits(expected[i]),
+                            $"{name}[{i}] exact after interrupted resume");
+                }
+                Check.True(loaded.TrainingState.GlobalStep == 6, "resumed global step reaches target");
+                Check.True(loaded.TrainingState.Optimizer.StepCount == 6, "resumed Adam age reaches target");
+
+                GptModel inferenceOnly = Checkpoint.Load(checkpointPath, B);
+                Check.True(inferenceOnly.Config == Small, "inference loader accepts V2 checkpoint");
+            }
+            finally
+            {
+                File.Delete(dataPath);
+                File.Delete(checkpointPath);
+            }
         }
 
         [Test]

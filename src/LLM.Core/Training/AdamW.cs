@@ -28,6 +28,32 @@ namespace LLM.Core.Training
         /// <summary>Number of <see cref="Step"/> calls so far (drives bias correction).</summary>
         public int StepCount => _t;
 
+        internal IEnumerable<(string Name, Tensor M, Tensor V)> StateEntries =>
+            _state.Select(e => (e.Key, e.Value.M, e.Value.V));
+
+        internal void RestoreState(Parameters parameters, int stepCount,
+            IEnumerable<(string Name, Tensor M, Tensor V)> entries)
+        {
+            if (_t != 0 || _state.Count != 0)
+                throw new InvalidOperationException("Adam state can only be restored into a fresh optimizer.");
+            if (stepCount < 0)
+                throw new InvalidDataException("Adam step count cannot be negative.");
+
+            foreach (var (name, m, v) in entries)
+            {
+                Tensor weight = parameters.Weight(name);
+                if (m.Shape.Length != weight.Shape.Length || v.Shape.Length != weight.Shape.Length ||
+                    !m.Shape.SequenceEqual(weight.Shape) || !v.Shape.SequenceEqual(weight.Shape))
+                    throw new InvalidDataException($"Adam moment shape does not match parameter '{name}'.");
+                _state.Add(name, (m, v));
+            }
+
+            if (stepCount > 0 && _state.Count != parameters.Names.Count())
+                throw new InvalidDataException(
+                    $"Adam state contains {_state.Count} parameters, expected {parameters.Names.Count()}.");
+            _t = stepCount;
+        }
+
         /// <summary>
         /// One AdamW update over every parameter in <paramref name="p"/> using the
         /// gradients currently stored in the registry:

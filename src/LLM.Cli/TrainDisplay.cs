@@ -15,6 +15,7 @@ internal sealed class TrainDisplay
 
     private readonly int _totalSteps;
     private readonly int _tokensPerStep;
+    private readonly int _startStep;
     private readonly List<(int Step, double Seconds)> _samples = new();
 
     private int _step;
@@ -24,10 +25,11 @@ internal sealed class TrainDisplay
     private DateTime _lastRedraw = DateTime.MinValue;
     private int _barLength; // chars of the bar line currently on screen (0 = none drawn)
 
-    public TrainDisplay(int totalSteps, int tokensPerStep)
+    public TrainDisplay(int totalSteps, int tokensPerStep, int startStep = 0)
     {
         _totalSteps = totalSteps;
         _tokensPerStep = tokensPerStep;
+        _startStep = startStep;
         BarEnabled = !Console.IsOutputRedirected;
     }
 
@@ -84,7 +86,7 @@ internal sealed class TrainDisplay
     private string PlainLine(TrainLog l)
     {
         string val = l.ValLoss.HasValue ? $"  val {l.ValLoss.Value:F4}" : "";
-        double tokSec = l.Step * (double)_tokensPerStep / Math.Max(l.Elapsed.TotalSeconds, 1e-9);
+        double tokSec = (l.Step - _startStep) * (double)_tokensPerStep / Math.Max(l.Elapsed.TotalSeconds, 1e-9);
         return $"step {l.Step,6}/{_totalSteps}  lr {l.Lr:E2}  loss {l.TrainLoss:F4}{val}  " +
                $"{tokSec:N0} tok/s  ({l.Elapsed:h\\:mm\\:ss})";
     }
@@ -107,7 +109,7 @@ internal sealed class TrainDisplay
     private double RollingTokSec()
     {
         if (_samples.Count < 2)
-            return _step * _tokensPerStep / Math.Max(_elapsed.TotalSeconds, 1e-9);
+            return (_step - _startStep) * _tokensPerStep / Math.Max(_elapsed.TotalSeconds, 1e-9);
         double weighted = 0, weights = 0;
         for (int i = 1; i < _samples.Count; i++)
         {

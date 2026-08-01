@@ -56,7 +56,8 @@ internal static partial class Cli
           llm train     --data <dir> [--steps 5000] [--dmodel 128] [--layers 4] [--heads 4]
                         [--ctx 128] [--batch 8] [--lr 6e-4] [--minlr 6e-5] [--warmup 100] [--wd 0.1]
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
-                        [--saveevery 0] [--out out/model.bin] [--init <checkpoint>] [--backend cpu|gpu]
+                        [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
+                        [--resume-step N] [--backend cpu|gpu]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend cpu|gpu]
           llm chat      --model <checkpoint> --tokenizer <dir-or-path>
@@ -206,44 +207,56 @@ internal static partial class Cli
                   Trains a GPT on the tokenizer.json + train.bin/val.bin produced by
                   `prepare`, and writes a checkpoint to --out (default out/model.bin).
                   Each optimizer step processes --batch sequences (default 8) at once.
-                  --init resumes from an existing checkpoint (config comes from it;
-                  the architecture flags are then ignored). --saveevery N writes the
-                  checkpoint every N steps. --backend gpu runs training on the default
-                  D3D12 device. Ctrl+C stops after the current step and
-                  still saves, so an interrupted run is never lost.
+                  --init resumes a V2 training checkpoint exactly (model, Adam, global
+                  step, LR schedule, and sampler RNG). V1 checkpoints contain weights
+                  only; --resume-step N can supply their known cumulative scheduler
+                  position during the one-time upgrade. Architecture flags are ignored
+                  when loading. --saveevery N writes the checkpoint every N global
+                  steps. --backend gpu runs training on the default D3D12 device.
+                  Ctrl+C stops after the current step and still saves.
                 """);
             return 0;
         }
 
         string dataDir = p.Require("data");
-        int steps = p.GetInt("steps", 5000);
+        int? stepsArg = p.GetInt("steps");
         int dmodel = p.GetInt("dmodel", 128);
         int layers = p.GetInt("layers", 4);
         int heads = p.GetInt("heads", 4);
         int ctx = p.GetInt("ctx", 128);
-        int batch = p.GetInt("batch", 8);
-        float lr = p.GetFloat("lr", 6e-4f);
-        float minlr = p.GetFloat("minlr", 6e-5f);
-        int warmup = p.GetInt("warmup", 100);
-        float wd = p.GetFloat("wd", 0.1f);
-        float gradclip = p.GetFloat("gradclip", 1.0f);
+        int? batchArg = p.GetInt("batch");
+        float? lrArg = p.GetFloat("lr");
+        float? minlrArg = p.GetFloat("minlr");
+        int? warmupArg = p.GetInt("warmup");
+        float? wdArg = p.GetFloat("wd");
+        float? gradclipArg = p.GetFloat("gradclip");
         int seed = p.GetInt("seed", 42);
         int logevery = p.GetInt("logevery", 10);
         int valevery = p.GetInt("valevery", 250);
         string outPath = p.Get("out", Path.Combine("out", "model.bin"));
         string? init = p.Get("init");
+        int resumeStep = p.GetInt("resume-step", 0);
         int saveevery = p.GetInt("saveevery", 0);
         string backendName = p.Get("backend", "cpu");
         p.Done();
 
         ITensorBackend backend = CreateBackend(backendName);
         GptModel model;
+        TrainingState? trainState = null;
         if (init is not null)
         {
-            model = Checkpoint.Load(init, backend);
-            Console.WriteLine($"model: resumed from {init} " +
-                              $"(vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
+            Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(init, backend);
+            model = loaded.Model;
+            trainState = loaded.TrainingState;
+            string resumeDescription = trainState is null
+                ? "legacy weights-only checkpoint"
+                : $"training state at global step {trainState.GlobalStep:N0} (Adam step {trainState.Optimizer.StepCount:N0})";
+            Console.WriteLine($"model: loaded {init} ({resumeDescription}; " +
+                              $"vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                               $"dmodel {model.Config.DModel}, layers {model.Config.NLayers}, heads {model.Config.NHeads})");
+            if (trainState is null)
+                Console.WriteLine("warning: this V1 checkpoint has no Adam/RNG/scheduler state; " +
+                                  "this restart must initialize those once before future resumes become exact.");
         }
         else
         {
@@ -253,6 +266,20 @@ internal static partial class Cli
             Console.WriteLine($"model: vocab {config.VocabSize}, ctx {ctx}, dmodel {dmodel}, " +
                               $"layers {layers}, heads {heads}, params {model.Params.Count:N0}");
         }
+
+        if (trainState is not null && resumeStep != 0)
+            throw new ArgumentException("--resume-step is only valid when upgrading a legacy V1 weights-only checkpoint.");
+        if (init is null && resumeStep != 0)
+            throw new ArgumentException("--resume-step requires --init with a legacy V1 weights-only checkpoint.");
+
+        TrainingConfiguration? stored = trainState?.Configuration;
+        int steps = stepsArg ?? stored?.TotalSteps ?? 5000;
+        int batch = batchArg ?? stored?.BatchSize ?? 8;
+        float lr = lrArg ?? stored?.MaxLr ?? 6e-4f;
+        float minlr = minlrArg ?? stored?.MinLr ?? 6e-5f;
+        int warmup = warmupArg ?? stored?.WarmupSteps ?? 100;
+        float wd = wdArg ?? stored?.WeightDecay ?? 0.1f;
+        float gradclip = gradclipArg ?? stored?.GradClip ?? 1.0f;
 
         var trainLoader = new DataLoader(Path.Combine(dataDir, "train.bin"));
         var valLoader = new DataLoader(Path.Combine(dataDir, "val.bin"));
@@ -268,6 +295,7 @@ internal static partial class Cli
             WarmupSteps = warmup,
             WeightDecay = wd,
             GradClip = gradclip,
+            ContextLength = model.Config.ContextLength,
             BatchSize = batch,
             Seed = seed,
             LogEvery = logevery,
@@ -275,16 +303,18 @@ internal static partial class Cli
             SaveEvery = saveevery,
         };
 
-        var display = new TrainDisplay(steps, model.Config.ContextLength * batch);
+        trainState ??= TrainingState.CreateNew(backend, opts, resumeStep);
+
+        var display = new TrainDisplay(steps, model.Config.ContextLength * batch, trainState.GlobalStep);
 
         string? outDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
         if (outDir is not null) Directory.CreateDirectory(outDir);
 
         // write to a temp file then move, so an interrupt mid-save can't corrupt the last good checkpoint
-        void SaveCheckpoint(GptModel m, string tag)
+        void SaveCheckpoint(GptModel m, TrainingState state, string tag)
         {
             string tmp = outPath + ".tmp";
-            Checkpoint.Save(m, tmp);
+            Checkpoint.SaveTraining(m, state, tmp);
             File.Move(tmp, outPath, overwrite: true);
             display.PrintLine($"checkpoint: saved {outPath} ({tag})");
         }
@@ -317,7 +347,7 @@ internal static partial class Cli
                 {
                     case 'r': return TrainCommand.Continue;
                     case 's':
-                        SaveCheckpoint(model, "manual save");
+                        SaveCheckpoint(model, trainState, "manual save");
                         return TrainCommand.Continue;
                     case 'q':
                         stoppedByUser = true;
@@ -328,18 +358,18 @@ internal static partial class Cli
 
         Console.WriteLine("controls: p = pause, Ctrl+C = save and quit");
         TrainSummary summary = Trainer.Train(model, trainLoader, valLoader, opts, display.OnLog,
-            onSave: saveevery > 0 ? (m, s) => SaveCheckpoint(m, $"step {s}") : null,
-            cancel: cts.Token, controlHook: ControlHook);
+            onSave: saveevery > 0 ? (m, s) => SaveCheckpoint(m, s, $"step {s.GlobalStep}") : null,
+            cancel: cts.Token, controlHook: ControlHook, state: trainState);
 
         display.Complete();
         if (stoppedByUser)
             Console.WriteLine($"stopped by user at step {summary.Steps}");
         string interrupted = !stoppedByUser && summary.Steps < steps
             ? $" (interrupted at step {summary.Steps}/{steps})" : "";
-        Console.WriteLine($"done: {summary.Steps} steps in {summary.Elapsed:h\\:mm\\:ss}{interrupted}, " +
+        Console.WriteLine($"done: global step {summary.Steps} after {summary.Elapsed:h\\:mm\\:ss} this run{interrupted}, " +
                           $"final train loss {summary.FinalTrainLoss:F4}" +
                           (summary.FinalValLoss.HasValue ? $", final val loss {summary.FinalValLoss.Value:F4}" : ""));
-        SaveCheckpoint(model, "final");
+        SaveCheckpoint(model, trainState, "final");
         return 0;
     }
 
@@ -518,8 +548,14 @@ internal static partial class Cli
         public int GetInt(string key, int fallback) =>
             Take(key) is string v ? int.Parse(v, CultureInfo.InvariantCulture) : fallback;
 
+        public int? GetInt(string key) =>
+            Take(key) is string v ? int.Parse(v, CultureInfo.InvariantCulture) : null;
+
         public float GetFloat(string key, float fallback) =>
             Take(key) is string v ? float.Parse(v, CultureInfo.InvariantCulture) : fallback;
+
+        public float? GetFloat(string key) =>
+            Take(key) is string v ? float.Parse(v, CultureInfo.InvariantCulture) : null;
 
         public void Done()
         {

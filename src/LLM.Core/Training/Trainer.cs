@@ -65,7 +65,7 @@ namespace LLM.Core.Training
         /// steps; a val loss (averaged over <see cref="TrainOptions.ValSamples"/>
         /// sequences) is included every <see cref="TrainOptions.ValEvery"/> steps
         /// when a val loader is given. <paramref name="onSave"/> is invoked with the
-        /// model and completed-step count every <see cref="TrainOptions.SaveEvery"/>
+        /// model and complete resumable state every <see cref="TrainOptions.SaveEvery"/>
         /// steps (never on the final step — the caller saves then). Cancelling
         /// <paramref name="cancel"/> stops after the current step; the summary's
         /// Steps reflects how many steps actually ran. <paramref name="controlHook"/>
@@ -75,8 +75,8 @@ namespace LLM.Core.Training
         /// </summary>
         public static TrainSummary Train(GptModel model, DataLoader train, DataLoader? val,
             TrainOptions opts, Action<TrainLog>? onLog = null,
-            Action<GptModel, int>? onSave = null, CancellationToken cancel = default,
-            Func<int, TrainCommand>? controlHook = null)
+            Action<GptModel, TrainingState>? onSave = null, CancellationToken cancel = default,
+            Func<int, TrainCommand>? controlHook = null, TrainingState? state = null)
         {
             if (val is null && opts.ValEvery != 0)
                 throw new ArgumentException("ValEvery is set but no val DataLoader was given.", nameof(val));
@@ -84,16 +84,18 @@ namespace LLM.Core.Training
                 throw new ArgumentException("BatchSize must be >= 1.", nameof(opts));
             int ctx = opts.ContextLength > 0 ? opts.ContextLength : model.Config.ContextLength;
             int batch = opts.BatchSize;
-            var rng = new Random(opts.Seed);
-            var adam = new AdamW(model.Backend);
+            state ??= TrainingState.CreateNew(model.Backend, opts);
+            state.RequireCompatible(opts);
+            TrainingRandom rng = state.DataRandom;
+            AdamW adam = state.Optimizer;
             int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
             var sw = Stopwatch.StartNew();
             bool prof = Environment.GetEnvironmentVariable("LLM_GPU_STATS") == "1";
 
             float lastTrain = 0f, lastVal = float.NaN;
-            int stepsRun = 0;
-            for (int step = 0; step < opts.Steps; step++)
+            int stepsRun = state.GlobalStep;
+            for (int step = state.GlobalStep; step < opts.Steps; step++)
             {
                 if (cancel.IsCancellationRequested) break;
                 float lr = LrSchedule.GetLr(step, opts.Steps, opts.MaxLr, opts.MinLr, opts.WarmupSteps);
@@ -113,6 +115,7 @@ namespace LLM.Core.Training
                 long p3 = prof ? Stopwatch.GetTimestamp() : 0;
                 adam.Step(model.Params, lr, weightDecay: opts.WeightDecay);
                 stepsRun = step + 1;
+                state.GlobalStep = stepsRun;
                 if (prof)
                 {
                     long p4 = Stopwatch.GetTimestamp();
@@ -136,14 +139,14 @@ namespace LLM.Core.Training
                 }
 
                 if (onSave is not null && opts.SaveEvery > 0 && stepsRun < opts.Steps && stepsRun % opts.SaveEvery == 0)
-                    onSave(model, stepsRun);
+                    onSave(model, state);
             }
             sw.Stop();
             return new TrainSummary(lastTrain, float.IsNaN(lastVal) ? null : lastVal, stepsRun, sw.Elapsed);
         }
 
         /// <summary>Mean loss of one batch of <paramref name="samples"/> random sequences; leaves grads dirty.</summary>
-        private static float EvalLoss(GptModel model, DataLoader data, Random rng, int ctx, int samples)
+        private static float EvalLoss(GptModel model, DataLoader data, TrainingRandom rng, int ctx, int samples)
         {
             int[] inputs = new int[samples * ctx], targets = new int[samples * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
