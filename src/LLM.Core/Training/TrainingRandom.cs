@@ -46,6 +46,22 @@ public sealed class TrainingRandom
         }
     }
 
+    /// <summary>Returns an unbiased integer in [0, <paramref name="maxExclusive"/>) for bounds above Int32.</summary>
+    public long NextInt64(long maxExclusive)
+    {
+        if (maxExclusive <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxExclusive), "Upper bound must be positive.");
+
+        ulong bound = (ulong)maxExclusive;
+        ulong threshold = unchecked(0UL - bound) % bound;
+        while (true)
+        {
+            ulong value = ((ulong)NextUInt32() << 32) | NextUInt32();
+            if (value >= threshold)
+                return (long)(value % bound);
+        }
+    }
+
     private uint NextUInt32()
     {
         ulong oldState = _state;

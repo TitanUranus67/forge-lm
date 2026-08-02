@@ -148,6 +148,26 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void TrainingRandom_SupportsBoundsAboveInt32()
+        {
+            const long bound = 10_000_000_000L;
+            var first = new TrainingRandom(123);
+            var second = new TrainingRandom(123);
+            bool reachedPastInt = false;
+
+            for (int i = 0; i < 1000; i++)
+            {
+                long a = first.NextInt64(bound);
+                long b = second.NextInt64(bound);
+                Check.True(a == b, $"large-bound sample {i} is deterministic");
+                Check.True(a >= 0 && a < bound, $"large-bound sample {a} is in range");
+                reachedPastInt |= a > int.MaxValue;
+            }
+
+            Check.True(reachedPastInt, "large-bound generator can reach offsets beyond Int32.MaxValue");
+        }
+
+        [Test]
         public static void Trainer_TrainLossDrops()
         {
             // Repetitive data: next token is fully predictable (i -> (i+1) mod 16).

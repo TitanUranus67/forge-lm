@@ -62,7 +62,9 @@ public sealed class DataLoader : IDisposable
     public void Sample(Random rng, int contextLength, int[] inputs, int[] targets)
     {
         ValidateSampleArguments(contextLength, inputs, targets);
-        FillSample(rng.Next((int)(_length - contextLength)), contextLength, inputs, targets);
+        long bound = _length - contextLength;
+        long offset = bound <= int.MaxValue ? rng.Next((int)bound) : rng.NextInt64(bound);
+        FillSample(offset, contextLength, inputs, targets);
     }
 
     /// <summary>
@@ -71,7 +73,9 @@ public sealed class DataLoader : IDisposable
     public void Sample(TrainingRandom rng, int contextLength, int[] inputs, int[] targets)
     {
         ValidateSampleArguments(contextLength, inputs, targets);
-        FillSample(rng.Next((int)(_length - contextLength)), contextLength, inputs, targets);
+        long bound = _length - contextLength;
+        long offset = bound <= int.MaxValue ? rng.Next((int)bound) : rng.NextInt64(bound);
+        FillSample(offset, contextLength, inputs, targets);
     }
 
     private void ValidateSampleArguments(int contextLength, int[] inputs, int[] targets)
@@ -82,19 +86,20 @@ public sealed class DataLoader : IDisposable
             throw new ArgumentException($"Not enough tokens ({_length}) for context length {contextLength}.");
     }
 
-    private void FillSample(int o, int contextLength, int[] inputs, int[] targets)
+    private void FillSample(long o, int contextLength, int[] inputs, int[] targets)
     {
         if (_ids is not null)
         {
+            int offset = checked((int)o); // in-memory arrays cannot exceed Int32 length
             for (int i = 0; i < contextLength; i++)
             {
-                inputs[i] = _ids[o + i];
-                targets[i] = _ids[o + i + 1];
+                inputs[i] = _ids[offset + i];
+                targets[i] = _ids[offset + i + 1];
             }
         }
         else
         {
-            long basePos = (long)o * 2;
+            long basePos = checked(o * 2);
             for (int i = 0; i < contextLength; i++)
             {
                 inputs[i] = _view!.ReadUInt16(basePos + (long)i * 2);
