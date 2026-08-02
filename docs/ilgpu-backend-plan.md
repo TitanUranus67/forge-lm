@@ -1,9 +1,10 @@
-# Plan: ILGPU (CUDA) backend + default-backend flip
+# Plan: ILGPU (CUDA) backend + safe automatic selection
 
 ## Goal
 Add a third tensor backend, `CudaBackend`, built on ILGPU (C# → CUDA PTX JIT), so the
-project runs on Linux/NVIDIA cloud GPUs (vast.ai et al.) — and make it the **default**
-backend on this machine too, provided it benches ≥ the D3D12 `GpuBackend`.
+project runs on Linux/NVIDIA cloud GPUs (vast.ai et al.). Add an `auto` selection mode
+that prefers CUDA on this machine only if it benches ≥ the D3D12 `GpuBackend`, while
+always falling back to D3D12 or CPU when CUDA is unavailable.
 
 ## Key facts (verified)
 - **ILGPU 1.5.3** (NuGet, MIT) targets .NET Standard 2.1 / .NET 5+ → works on net9.0.
@@ -59,20 +60,28 @@ New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
    200-step overfit smoke. Suite: 77 + ~16 = 93+ tests, ALL PASSED, 0 warnings.
 
 ## Milestone 3 — CLI + bench gate
-1. `--backend cpu|gpu|cuda` on train/generate/chat (default stays `cpu` until M4);
+1. `--backend auto|cpu|gpu|cuda` on train/generate/chat (default stays `cpu` until M4);
    startup line prints device + VRAM for cuda too. README updated.
-2. Bench on the RTX 2080 at 110M config (768/12/12/512, batch 4, 100 steps, steady-state
+2. Bench on the RTX 2080 at 110M config (768/12/12/512, batch 4, 100 steps after JIT
+   warmup, steady-state
    last-line tok/s): cpu vs gpu vs cuda. **Gate: cuda ≥ gpu × 0.95** to flip the default
-   in M4; also confirm device committed memory plateaus (bucketed allocator doing its job,
-   no creep over 100 steps).
+   auto preference order in M4; also confirm device committed memory plateaus (bucketed
+   allocator doing its job, no creep over 100 steps).
 3. Also smoke `generate --backend cuda` (sampler path) and checkpoint save/load round-trip
    with cuda tensors resident.
 
-## Milestone 4 — Default flip + commit
-1. Default `--backend` becomes `cuda` (train/generate/chat) with `gpu` (D3D12) and `cpu`
-   still selectable; help/README updated (D3D12 documented as the Windows fallback).
-2. Commit: "Add ILGPU CUDA backend, make it the default" (user approves commit message
-   as usual). Keep GpuBackend in the tree and tested — it's the fallback, not dead code.
+## Milestone 4 — Safe automatic selection + commit
+1. Default `--backend` becomes `auto` for train/generate/chat. Selection is capability-
+   checked and never fails merely because an optional accelerator is absent:
+   - if the M3 performance gate passes: CUDA → D3D12 → CPU;
+   - if it fails on Windows: D3D12 → CUDA → CPU;
+   - on Linux: CUDA → CPU.
+   Explicit `--backend cuda|gpu` remains fail-loud instead of silently changing devices.
+2. Add selection tests with injectable capability probes so CUDA-absent, D3D12-absent,
+   and CPU-only machines all have deterministic coverage. A fresh command with no
+   `--backend` must succeed on a CPU-only host.
+3. Commit: "Add ILGPU CUDA backend with automatic fallback". Keep GpuBackend in the
+   tree and tested — it is a supported backend, not dead code.
 
 ## Explicit non-goals / follow-ups
 - No fp16/TF32/tensor cores (fp32 throughout, like the rest of the project).
@@ -87,4 +96,5 @@ New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
 - M1: 77 + new trivial-kernel tests green.
 - M2: full suite (93+) green incl. cuda gradient check + overfit.
 - M3: bench numbers reported (cpu/gpu/cuda), plateau confirmed.
-- M4: suite green, commit made, fresh `train` with no --backend flag runs on cuda.
+- M4: suite green, commit made, fresh commands with no `--backend` select the fastest
+  available validated backend and still run on a CPU-only host.
