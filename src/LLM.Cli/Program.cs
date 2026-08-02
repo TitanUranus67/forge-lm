@@ -442,11 +442,13 @@ internal static partial class Cli
         Console.Write(prompt);
         var sw = Stopwatch.StartNew();
         int count = 0;
+        BpeTokenizer.Utf8StreamDecoder decoder = tok.CreateUtf8StreamDecoder();
         foreach (int id in Sampler.Generate(model, promptIds, tokens, temperature, topk, rng))
         {
-            Console.Write(tok.Decode(new[] { id }));
+            Console.Write(decoder.DecodeToken(id));
             count++;
         }
+        Console.Write(decoder.Flush());
         sw.Stop();
         Console.WriteLine();
         Console.WriteLine("---");
@@ -516,11 +518,13 @@ internal static partial class Cli
                 history.RemoveRange(0, history.Count - keep);
 
             Console.Write("llm> ");
+            BpeTokenizer.Utf8StreamDecoder decoder = tok.CreateUtf8StreamDecoder();
             foreach (int id in Sampler.Generate(model, history, tokensPerTurn, temperature, topk, rng))
             {
-                Console.Write(tok.Decode(new[] { id }));
+                Console.Write(decoder.DecodeToken(id));
                 history.Add(id);
             }
+            Console.Write(decoder.Flush());
             Console.WriteLine();
         }
         return 0;

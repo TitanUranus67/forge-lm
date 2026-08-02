@@ -127,6 +127,23 @@ public static class BpeTokenizerTests
     }
 
     [Test]
+    public static void StreamingDecode_PreservesUtf8AcrossTokenBoundaries()
+    {
+        var tok = BpeTokenizer.Train(Array.Empty<byte>(), 0);
+        byte[] globe = Encoding.UTF8.GetBytes("🌍");
+        var decoder = tok.CreateUtf8StreamDecoder();
+        string output = string.Concat(globe.Select(b => decoder.DecodeToken(b))) + decoder.Flush();
+
+        Check.True(output == "🌍", "streaming decoder joins UTF-8 bytes split across four tokens");
+
+        var incomplete = tok.CreateUtf8StreamDecoder();
+        string prefix = incomplete.DecodeToken(globe[0]);
+        string flushed = incomplete.Flush();
+        Check.True(prefix.Length == 0, "incomplete UTF-8 prefix is buffered");
+        Check.True(flushed == "�", "flush exposes an incomplete trailing sequence once");
+    }
+
+    [Test]
     public static void Train_Deterministic_SeededRandomCorpus()
     {
         byte[] corpus = SeededText(1234, 5000);

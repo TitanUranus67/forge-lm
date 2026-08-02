@@ -38,6 +38,40 @@ public sealed class BpeTokenizer
     public int VocabSize => 256 + _merges.Count;
 
     /// <summary>
+    /// Stateful UTF-8 decoder for autoregressive output. BPE token boundaries are
+    /// byte boundaries, not necessarily Unicode character boundaries, so decoding
+    /// one token at a time with <see cref="Decode"/> can emit replacement characters.
+    /// This decoder retains incomplete UTF-8 sequences until later tokens arrive.
+    /// </summary>
+    public sealed class Utf8StreamDecoder
+    {
+        private readonly BpeTokenizer _tokenizer;
+        private readonly Decoder _decoder = Encoding.UTF8.GetDecoder();
+
+        internal Utf8StreamDecoder(BpeTokenizer tokenizer) => _tokenizer = tokenizer;
+
+        /// <summary>Decodes one token, returning only characters completed by the bytes seen so far.</summary>
+        public string DecodeToken(int tokenId)
+        {
+            byte[] bytes = _tokenizer.TokenBytes(tokenId);
+            var chars = new char[Encoding.UTF8.GetMaxCharCount(bytes.Length)];
+            int written = _decoder.GetChars(bytes, 0, bytes.Length, chars, 0, flush: false);
+            return new string(chars, 0, written);
+        }
+
+        /// <summary>Flushes any incomplete trailing sequence using the standard UTF-8 replacement fallback.</summary>
+        public string Flush()
+        {
+            var chars = new char[2];
+            int written = _decoder.GetChars(Array.Empty<byte>(), 0, 0, chars, 0, flush: true);
+            return new string(chars, 0, written);
+        }
+    }
+
+    /// <summary>Creates a stateful decoder suitable for printing generated tokens as they arrive.</summary>
+    public Utf8StreamDecoder CreateUtf8StreamDecoder() => new(this);
+
+    /// <summary>
     /// Trains a tokenizer on <paramref name="corpus"/> by learning
     /// <paramref name="numMerges"/> merge rules. Adjacent-pair counts are built
     /// once and then maintained incrementally around each merge site, and the
@@ -271,6 +305,13 @@ public sealed class BpeTokenizer
             pos += _vocab[id].Length;
         }
         return Encoding.UTF8.GetString(bytes);
+    }
+
+    private byte[] TokenBytes(int tokenId)
+    {
+        if ((uint)tokenId >= (uint)_vocab.Count)
+            throw new ArgumentOutOfRangeException(nameof(tokenId), tokenId, "token id is outside the vocabulary");
+        return _vocab[tokenId];
     }
 
     /// <summary>Serializes the tokenizer (merges only; the vocab is derived) to JSON.</summary>
