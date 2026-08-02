@@ -147,5 +147,30 @@ namespace LLM.Core.Tests
             }
             finally { File.Delete(path); }
         }
+
+        [Test]
+        public static void OpenReader_AllowsAtomicCheckpointReplacement()
+        {
+            string path = Path.GetTempFileName();
+            string replacement = path + ".replacement";
+            try
+            {
+                File.WriteAllBytes(path, new byte[] { 1, 2, 3 });
+                File.WriteAllBytes(replacement, new byte[] { 4, 5, 6 });
+
+                using FileStream existingReader = Checkpoint.OpenCheckpointRead(path);
+                Checkpoint.PublishAtomically(replacement, path);
+
+                Check.True(existingReader.ReadByte() == 1,
+                    "reader opened before replacement retains the old checkpoint generation");
+                Check.True(File.ReadAllBytes(path).SequenceEqual(new byte[] { 4, 5, 6 }),
+                    "new readers see the replacement checkpoint generation");
+            }
+            finally
+            {
+                File.Delete(path);
+                File.Delete(replacement);
+            }
+        }
     }
 }

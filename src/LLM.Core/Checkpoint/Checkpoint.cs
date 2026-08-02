@@ -149,7 +149,7 @@ namespace LLM.Core.Checkpoint
         private static LoadedTrainingCheckpoint LoadCore(string path, ITensorBackend backend,
             bool restoreTrainingState)
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+            using var fs = OpenCheckpointRead(path);
             using var br = new BinaryReader(fs);
 
             byte[] magic = br.ReadBytes(MagicV1.Length);
@@ -218,6 +218,29 @@ namespace LLM.Core.Checkpoint
             var rng = new TrainingRandom(t.DataRngState, t.DataRngIncrement);
             var state = new TrainingState(t.GlobalStep, optimizer, rng, trainingConfig);
             return new LoadedTrainingCheckpoint(model, state);
+        }
+
+        /// <summary>
+        /// Opens a stable handle to the current checkpoint generation while allowing
+        /// the trainer to atomically replace the path with a newer generation.
+        /// Existing readers continue consuming the old file; new readers see the new one.
+        /// </summary>
+        internal static FileStream OpenCheckpointRead(string path) => new(path, new FileStreamOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.ReadWrite | FileShare.Delete,
+            BufferSize = 1 << 20,
+            Options = FileOptions.SequentialScan,
+        });
+
+        /// <summary>Publishes a fully written temporary checkpoint without disrupting existing shared readers.</summary>
+        public static void PublishAtomically(string temporaryPath, string destinationPath)
+        {
+            if (File.Exists(destinationPath))
+                File.Replace(temporaryPath, destinationPath, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            else
+                File.Move(temporaryPath, destinationPath);
         }
 
         private static void ReadTensor(BinaryReader reader, Tensor tensor)

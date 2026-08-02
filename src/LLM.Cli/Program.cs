@@ -344,7 +344,7 @@ internal static partial class Cli
         {
             string tmp = outPath + ".tmp";
             Checkpoint.SaveTraining(m, state, tmp);
-            File.Move(tmp, outPath, overwrite: true);
+            Checkpoint.PublishAtomically(tmp, outPath);
             display.PrintLine($"checkpoint: saved {outPath} ({tag})");
         }
 
