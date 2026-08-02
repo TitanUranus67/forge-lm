@@ -11,7 +11,8 @@ namespace LLM.Core.Checkpoint
     /// Versioned, deterministic binary checkpoints. V1 contains model configuration
     /// and weights. V2 additionally contains the complete resumable training state:
     /// cumulative global step, LR schedule/configuration, sampler RNG state, Adam age,
-    /// and first/second moment tensors. Both versions remain loadable for inference.
+    /// and first/second moment tensors. V3 adds input identities and a SHA-256 trailer.
+    /// Every version remains loadable for inference.
     /// </summary>
     public static class Checkpoint
     {

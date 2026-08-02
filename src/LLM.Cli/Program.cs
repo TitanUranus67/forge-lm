@@ -50,11 +50,11 @@ internal static partial class Cli
     }
 
     internal static void PrintUsage() => Console.WriteLine("""
-        LLM.Cli — mini-GPT from scratch (zero dependencies)
+        LLM.Cli — mini-GPT from scratch in C#
 
         Usage:
           llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
-          llm prepare-fineweb --out <dir> [--shards 10] [--merges 16000] [--toktrainmb 200]
+          llm prepare-fineweb --out <dir> [--shards 10] [--merges 16000] [--toktrainmb 200] [--rebuild true]
           llm train     --data <dir> [--steps 5000 | --tokens N] [--dmodel 128] [--layers 4] [--heads 4]
                         [--ctx 128] [--batch 8] [--accum 16] [--lr 6e-4] [--minlr 6e-5]
                         [--warmup 100 | --warmup-tokens N] [--wd 0.1]
@@ -212,8 +212,10 @@ internal static partial class Cli
                   `prepare`, and writes a checkpoint to --out (default out/model.bin).
                   Each physical pass processes --batch sequences (default 8); --accum
                   physical passes are averaged into each optimizer update (default 16).
-                  --init resumes a V2 training checkpoint exactly (model, Adam, global
-                  step, LR schedule, and sampler RNG). V1 checkpoints contain weights
+                  --init resumes a V2/V3 training checkpoint exactly (model, Adam,
+                  global step, LR schedule, and sampler RNG). V3 also verifies a
+                  SHA-256 checksum plus tokenizer/training-data identity and rotates
+                  the previous save to .bak. V1 checkpoints contain weights
                   only; --resume-step N can supply their known cumulative scheduler
                   position during the one-time upgrade. Architecture flags are ignored
                   when loading. --saveevery N writes the checkpoint every N global

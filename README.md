@@ -12,12 +12,12 @@ parquet shards for `prepare-fineweb`.
 
 ```sh
 dotnet build
-dotnet run --project tests/LLM.Core.Tests   # 72 tests (GPU tests skip cleanly without a D3D12 device)
+dotnet run --project tests/LLM.Core.Tests   # 87 tests (GPU tests skip cleanly without a D3D12 device)
 ```
 
 ## Quickstart
 
-The CLI has three subcommands (tokenizer training is folded into `prepare`):
+The CLI has five subcommands (tokenizer training is folded into `prepare`):
 
 ```sh
 # 1. Download tiny-shakespeare, train a BPE tokenizer, encode to train/val bins
@@ -60,7 +60,10 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   (default 200), then stream-encodes the full corpus in 50 MB newline-aligned
   chunks — a multi-GB corpus never has to fit in memory. Encoding is the slow
   phase (tens of minutes to hours depending on merges/corpus size); progress in
-  MB is printed per chunk.
+  MB is printed per chunk. Corpus, tokenizer, and bin artifacts are published
+  transactionally with provenance manifests; stale or incomplete artifacts are
+  never silently reused. `--rebuild true` regenerates derived artifacts while
+  retaining downloaded shards.
 - `train` runs a batched training loop. Each physical `[B*T, C]` pass contains
   `--batch N` sequences (default 8); the CLI defaults to `--accum 16`, averaging
   16 physical-batch gradients before clipping and one Adam/LR update. `--tokens`
@@ -70,18 +73,23 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   Validation is the
   forward-only mean over 50 deterministic physical-size batches by default
   (`--valbatches`/`--valseed`), evaluated in microbatches so it does not raise
-  peak VRAM or perturb the training sampler. On an interactive
+  peak VRAM or perturb the training sampler. Validation cadence is independent
+  of logging cadence. On an interactive
   console an in-place progress bar shows percent, step, loss, rolling tok/s,
   ETA and elapsed time (it falls back to plain log lines when output is piped);
   pressing `p` pauses (resume, save+resume, or save+quit). Checkpoints are written
   at the end, every `--saveevery N` steps, and on Ctrl+C (the run finishes its
-  current step, then saves) — an interrupted run is never lost. New V2 training
+  current step, then saves) — an interrupted run is never lost. V2+ training
   checkpoints preserve the global step, Adam moments, LR schedule, and sampler RNG,
   so `--init` continues the same trajectory instead of restarting warmup. Legacy V1
   model-only checkpoints still load; `--resume-step` can provide their known global
-  scheduler position during the one-time upgrade.
+  scheduler position during the one-time upgrade. New V3 saves add a SHA-256 trailer,
+  bind the checkpoint to its tokenizer and training data, and rotate the previous
+  generation to `<checkpoint>.bak`. Loading V1/V2 remains supported; the next save
+  upgrades it. Startup hashes the input files before an optimizer update.
 - `generate` loads a checkpoint and samples autoregressively with temperature
-  and top-k filtering.
+  and top-k filtering. An incremental UTF-8 decoder preserves characters whose
+  bytes span token boundaries.
 - `chat` is an interactive REPL over a checkpoint: each line you type is appended
   to a rolling context the model continues. `/reset` clears context, `/quit` exits.
 
@@ -89,7 +97,8 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
 
 - **BPE tokenizer** (`Tokenizer/BpeTokenizer.cs`) — byte-level, GPT-2 style.
   Ids 0–255 are raw bytes; learned merges produce ids 256+. Encoding is
-  rank-greedy; any byte sequence round-trips losslessly.
+  rank-greedy; arbitrary bytes remain representable and valid UTF-8 text
+  round-trips losslessly.
 - **GPT model** (`Model/`) — GPT-2 architecture: learned token + positional
   embeddings, pre-LN transformer blocks (multi-head causal self-attention +
   GELU MLP), final LayerNorm, untied output head. Training is batched: B
@@ -101,7 +110,7 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
 - **Training** (`Training/`) — AdamW (decoupled weight decay on 2-D params),
   averaged gradient accumulation, linear-warmup + cosine-decay in optimizer-update
   units, global gradient-norm clipping, and a checkpointable random-offset data
-  loader over raw uint16 token files.
+  loader over raw uint16 token files, including files beyond 2.147 billion tokens.
 - **CPU backend** (`Tensor/CpuBackend.cs`) — all math through an
   `ITensorBackend` interface; the CPU implementation uses `Vector<T>` SIMD in
   the matmul inner loops. Large matmuls parallelize over output rows with
@@ -125,7 +134,8 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
 - **Checkpoints** (`Checkpoint/Checkpoint.cs`) — versioned custom binary format.
   `LLMSCRATCH1` is the legacy model-only format. `LLMSCRATCH2` adds cumulative step,
   schedule/configuration, sampler RNG, Adam age, and first/second moment tensors to
-  the model weights. Loading validates the exact payload size and parameter registry.
+  the model weights. `LLMSCRATCH3` adds input identities and a SHA-256 checksum.
+  Loading validates the exact payload size and parameter registry.
   Checkpoints are backend-agnostic: train on GPU, generate on CPU or vice versa.
 
 ## GPU backend notes

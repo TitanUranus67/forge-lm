@@ -43,7 +43,7 @@ New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
    kernels leave device authoritative, downloads on demand).
 5. Trivial kernels first (Fill/Zero, Copy, CopyBlock, AddInPlace, Scale, Transpose) +
    `tests/LLM.Core.Tests/CudaBackendTests.cs` with skip-if-no-CUDA and the first
-   kernel-vs-CPU comparisons. All existing 77 tests keep passing.
+   kernel-vs-CPU comparisons. All existing 87 tests keep passing.
 
 ## Milestone 2 — Full kernel port + validation
 1. Elementwise/reduction kernels: AddBias, SumRows (atomics), GeluForward/Backward,
@@ -57,7 +57,7 @@ New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
 4. Mirror the GPU test suite into CudaBackendTests: every kernel vs CpuBackend
    (same tolerances), residency tests (incl. the stale-without-invalidate behavior),
    CE aliasing, BucketOf property test, full-model batched gradient check (tiny config),
-   200-step overfit smoke. Suite: 77 + ~16 = 93+ tests, ALL PASSED, 0 warnings.
+   200-step overfit smoke. Suite: 87 + ~16 = 103+ tests, ALL PASSED, 0 warnings.
 
 ## Milestone 3 — CLI + bench gate
 1. `--backend auto|cpu|gpu|cuda` on train/generate/chat (default stays `cpu` until M4);
@@ -93,8 +93,8 @@ New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
   background agent caused file-lock chaos earlier in this project).
 
 ## Verification per milestone
-- M1: 77 + new trivial-kernel tests green.
-- M2: full suite (93+) green incl. cuda gradient check + overfit.
+- M1: 87 + new trivial-kernel tests green.
+- M2: full suite (103+) green incl. cuda gradient check + overfit.
 - M3: bench numbers reported (cpu/gpu/cuda), plateau confirmed.
 - M4: suite green, commit made, fresh commands with no `--backend` select the fastest
   available validated backend and still run on a CPU-only host.
