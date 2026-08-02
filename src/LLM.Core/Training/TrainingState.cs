@@ -21,22 +21,41 @@ namespace LLM.Core.Training
     public sealed class TrainingState
     {
         internal TrainingState(int globalStep, AdamW optimizer, TrainingRandom dataRandom,
-            TrainingConfiguration configuration)
+            TrainingConfiguration configuration, string? dataIdentity = null, string? tokenizerIdentity = null)
         {
             if (globalStep < 0) throw new ArgumentOutOfRangeException(nameof(globalStep));
             GlobalStep = globalStep;
             Optimizer = optimizer;
             DataRandom = dataRandom;
             Configuration = configuration;
+            DataIdentity = dataIdentity;
+            TokenizerIdentity = tokenizerIdentity;
         }
 
         public int GlobalStep { get; internal set; }
         public AdamW Optimizer { get; }
         public TrainingRandom DataRandom { get; }
         public TrainingConfiguration Configuration { get; }
+        public string? DataIdentity { get; private set; }
+        public string? TokenizerIdentity { get; private set; }
 
-        public static TrainingState CreateNew(ITensorBackend backend, TrainOptions options, int globalStep = 0) =>
-            new(globalStep, new AdamW(backend), new TrainingRandom(options.Seed), FromOptions(options));
+        public static TrainingState CreateNew(ITensorBackend backend, TrainOptions options, int globalStep = 0,
+            string? dataIdentity = null, string? tokenizerIdentity = null) =>
+            new(globalStep, new AdamW(backend), new TrainingRandom(options.Seed), FromOptions(options),
+                dataIdentity, tokenizerIdentity);
+
+        /// <summary>Binds a legacy checkpoint once, or verifies that a bound checkpoint uses the same inputs.</summary>
+        public void RequireDataIdentity(string dataIdentity, string tokenizerIdentity)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(dataIdentity);
+            ArgumentException.ThrowIfNullOrWhiteSpace(tokenizerIdentity);
+            if (DataIdentity is not null && DataIdentity != dataIdentity)
+                throw new InvalidDataException("Training data does not match the dataset recorded in the checkpoint.");
+            if (TokenizerIdentity is not null && TokenizerIdentity != tokenizerIdentity)
+                throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");
+            DataIdentity ??= dataIdentity;
+            TokenizerIdentity ??= tokenizerIdentity;
+        }
 
         internal static TrainingConfiguration FromOptions(TrainOptions options) => new(
             options.Steps,

@@ -77,7 +77,7 @@ namespace LLM.Core.Tests
                     Trainer.Train(uninterrupted, data, val: null, opts);
 
                 var interrupted = new GptModel(Small, B, new Random(42));
-                TrainingState state = TrainingState.CreateNew(B, opts);
+                TrainingState state = TrainingState.CreateNew(B, opts, dataIdentity: "data-A", tokenizerIdentity: "tok-A");
                 using (var data = new DataLoader(dataPath))
                     Trainer.Train(interrupted, data, val: null, opts,
                         controlHook: step => step == 3 ? TrainCommand.SaveAndQuit : TrainCommand.Continue,
@@ -88,6 +88,8 @@ namespace LLM.Core.Tests
                 Check.True(loaded.TrainingState is not null, "V2 checkpoint restores training state");
                 Check.True(loaded.TrainingState!.GlobalStep == 3, "global step round-trips");
                 Check.True(loaded.TrainingState.Optimizer.StepCount == 3, "Adam age round-trips");
+                Check.True(loaded.TrainingState.DataIdentity == "data-A", "training data identity round-trips");
+                Check.True(loaded.TokenizerIdentity == "tok-A", "tokenizer identity is available as metadata");
                 using (var data = new DataLoader(dataPath))
                     Trainer.Train(loaded.Model, data, val: null, opts, state: loaded.TrainingState);
 
@@ -153,24 +155,77 @@ namespace LLM.Core.Tests
         {
             string path = Path.GetTempFileName();
             string replacement = path + ".replacement";
+            string backup = path + ".backup";
             try
             {
                 File.WriteAllBytes(path, new byte[] { 1, 2, 3 });
                 File.WriteAllBytes(replacement, new byte[] { 4, 5, 6 });
 
-                using FileStream existingReader = Checkpoint.OpenCheckpointRead(path);
-                Checkpoint.PublishAtomically(replacement, path);
+                using (FileStream existingReader = Checkpoint.OpenCheckpointRead(path))
+                {
+                    Checkpoint.PublishAtomically(replacement, path, backup);
 
-                Check.True(existingReader.ReadByte() == 1,
-                    "reader opened before replacement retains the old checkpoint generation");
-                Check.True(File.ReadAllBytes(path).SequenceEqual(new byte[] { 4, 5, 6 }),
-                    "new readers see the replacement checkpoint generation");
+                    Check.True(existingReader.ReadByte() == 1,
+                        "reader opened before replacement retains the old checkpoint generation");
+                    Check.True(File.ReadAllBytes(path).SequenceEqual(new byte[] { 4, 5, 6 }),
+                        "new readers see the replacement checkpoint generation");
+                    Check.True(File.ReadAllBytes(backup).SequenceEqual(new byte[] { 1, 2, 3 }),
+                        "atomic publication retains the previous checkpoint as a backup");
+                }
+
+                File.WriteAllBytes(replacement, new byte[] { 7, 8, 9 });
+                Checkpoint.PublishAtomically(replacement, path, backup);
+                Check.True(File.ReadAllBytes(path).SequenceEqual(new byte[] { 7, 8, 9 }),
+                    "a later publication replaces the destination again");
+                Check.True(File.ReadAllBytes(backup).SequenceEqual(new byte[] { 4, 5, 6 }),
+                    "an existing backup is rotated to the immediately previous generation");
             }
             finally
             {
                 File.Delete(path);
                 File.Delete(replacement);
+                File.Delete(backup);
             }
+        }
+
+        [Test]
+        public static void TrainingCheckpoint_SameSizeCorruptionFailsChecksum()
+        {
+            string path = Path.GetTempFileName();
+            try
+            {
+                var model = new GptModel(Small, B, new Random(9));
+                var options = new TrainOptions
+                {
+                    Steps = 2,
+                    MaxLr = 1e-3f,
+                    MinLr = 1e-4f,
+                    WarmupSteps = 1,
+                    ContextLength = Small.ContextLength,
+                    BatchSize = 1,
+                    ValEvery = 0,
+                };
+                TrainingState state = TrainingState.CreateNew(B, options,
+                    dataIdentity: "data", tokenizerIdentity: "tokenizer");
+                Checkpoint.SaveTraining(model, state, path);
+
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    fs.Position = fs.Length - 33; // final payload byte, immediately before the SHA-256 trailer
+                    int original = fs.ReadByte();
+                    fs.Position--;
+                    fs.WriteByte((byte)(original ^ 0x01));
+                }
+
+                bool threw = false;
+                try { Checkpoint.LoadTraining(path, B); }
+                catch (InvalidDataException ex) when (ex.Message.Contains("checksum", StringComparison.OrdinalIgnoreCase))
+                {
+                    threw = true;
+                }
+                Check.True(threw, "same-size checkpoint corruption is detected by SHA-256");
+            }
+            finally { File.Delete(path); }
         }
     }
 }

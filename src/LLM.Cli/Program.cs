@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using LLM.Core.Checkpoint;
 using LLM.Core.Inference;
 using LLM.Core.Model;
@@ -332,7 +334,12 @@ internal static partial class Cli
             SaveEvery = saveevery,
         };
 
-        trainState ??= TrainingState.CreateNew(backend, opts, resumeStep);
+        Console.WriteLine("data identity: hashing tokenizer.json, train.bin, and val.bin...");
+        string tokenizerIdentity = ContentSha256(Path.Combine(dataDir, "tokenizer.json"));
+        string dataIdentity = CombinedIdentity(tokenizerIdentity,
+            ContentSha256(Path.Combine(dataDir, "train.bin")), ContentSha256(Path.Combine(dataDir, "val.bin")));
+        trainState ??= TrainingState.CreateNew(backend, opts, resumeStep, dataIdentity, tokenizerIdentity);
+        trainState.RequireDataIdentity(dataIdentity, tokenizerIdentity);
 
         var display = new TrainDisplay(steps, checked((int)tokensPerUpdate), trainState.GlobalStep);
 
@@ -344,7 +351,7 @@ internal static partial class Cli
         {
             string tmp = outPath + ".tmp";
             Checkpoint.SaveTraining(m, state, tmp);
-            Checkpoint.PublishAtomically(tmp, outPath);
+            Checkpoint.PublishAtomically(tmp, outPath, outPath + ".bak");
             display.PrintLine($"checkpoint: saved {outPath} ({tag})");
         }
 
@@ -431,7 +438,13 @@ internal static partial class Cli
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;
         var tok = BpeTokenizer.Load(tokPath);
-        var model = Checkpoint.Load(modelPath, CreateBackend(backendName));
+        Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(modelPath, CreateBackend(backendName));
+        string tokenizerIdentity = ContentSha256(tokPath);
+        if (loaded.TokenizerIdentity is not null && loaded.TokenizerIdentity != tokenizerIdentity)
+            throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");
+        if (loaded.TokenizerIdentity is null)
+            Console.WriteLine("warning: legacy checkpoint has no tokenizer identity to verify.");
+        GptModel model = loaded.Model;
         Console.WriteLine($"model: {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                           $"params {model.Params.Count:N0})");
 
@@ -489,7 +502,13 @@ internal static partial class Cli
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;
         var tok = BpeTokenizer.Load(tokPath);
-        var model = Checkpoint.Load(modelPath, CreateBackend(backendName));
+        Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(modelPath, CreateBackend(backendName));
+        string tokenizerIdentity = ContentSha256(tokPath);
+        if (loaded.TokenizerIdentity is not null && loaded.TokenizerIdentity != tokenizerIdentity)
+            throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");
+        if (loaded.TokenizerIdentity is null)
+            Console.WriteLine("warning: legacy checkpoint has no tokenizer identity to verify.");
+        GptModel model = loaded.Model;
         var rng = new Random(seed);
 
         Console.WriteLine($"model: {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
@@ -540,6 +559,16 @@ internal static partial class Cli
             throw new ArgumentException($"{flag} requires {updates:N0} optimizer updates, above the supported limit.");
         return (int)updates;
     }
+
+    private static string ContentSha256(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            8 << 20, FileOptions.SequentialScan);
+        return Convert.ToHexString(SHA256.HashData(stream));
+    }
+
+    private static string CombinedIdentity(params string[] components) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('|', components))));
 
     private static void WriteIds(string path, ReadOnlySpan<int> ids)
     {
