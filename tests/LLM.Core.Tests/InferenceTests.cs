@@ -110,5 +110,25 @@ namespace LLM.Core.Tests
             Check.True(outTokens.Count == 1 && outTokens[0] == first,
                 $"generation stops after yielding eos (got {outTokens.Count} tokens)");
         }
+
+        [Test]
+        public static void InvalidSamplingOptionsFailLoudly()
+        {
+            bool emptyThrew = false;
+            try { Sampler.Sample(ReadOnlySpan<float>.Empty, 1f, 0, new Random(1)); }
+            catch (ArgumentException) { emptyThrew = true; }
+            Check.True(emptyThrew, "sampling an empty logit vector throws");
+
+            bool temperatureThrew = false;
+            try { Sampler.Sample(new[] { 1f }, float.NaN, 0, new Random(1)); }
+            catch (ArgumentException) { temperatureThrew = true; }
+            Check.True(temperatureThrew, "non-finite temperature throws");
+
+            var model = new GptModel(Small, B, new Random(2));
+            bool countThrew = false;
+            try { _ = Sampler.Generate(model, new[] { 1 }, -1, 1f, 0, new Random(1)).ToList(); }
+            catch (ArgumentOutOfRangeException) { countThrew = true; }
+            Check.True(countThrew, "negative generation length throws");
+        }
     }
 }

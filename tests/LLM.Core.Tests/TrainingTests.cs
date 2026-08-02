@@ -212,6 +212,42 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void Trainer_InvalidOptionsFailBeforeTraining()
+        {
+            string path = WriteRepetitiveTokens(256);
+            try
+            {
+                using var data = new DataLoader(path);
+                var model = new GptModel(Small, B, new Random(1));
+                var valid = new TrainOptions
+                {
+                    Steps = 2,
+                    WarmupSteps = 1,
+                    ContextLength = Small.ContextLength,
+                    ValEvery = 0,
+                };
+
+                foreach (TrainOptions invalid in new[]
+                {
+                    valid with { Steps = 0 },
+                    valid with { MaxLr = float.NaN },
+                    valid with { MinLr = valid.MaxLr + 1f },
+                    valid with { WarmupSteps = valid.Steps },
+                    valid with { WeightDecay = -0.1f },
+                    valid with { LogEvery = 0 },
+                    valid with { ContextLength = Small.ContextLength + 1 },
+                })
+                {
+                    bool threw = false;
+                    try { Trainer.Train(model, data, val: null, invalid); }
+                    catch (ArgumentException) { threw = true; }
+                    Check.True(threw, $"invalid training options fail before the first step: {invalid}");
+                }
+            }
+            finally { File.Delete(path); }
+        }
+
+        [Test]
         public static void Validation_DoesNotPerturbTrainingTrajectory()
         {
             string path = WriteRepetitiveTokens(2048);

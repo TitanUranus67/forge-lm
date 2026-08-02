@@ -83,6 +83,18 @@ namespace LLM.Core.Training
             Action<GptModel, TrainingState>? onSave = null, CancellationToken cancel = default,
             Func<int, TrainCommand>? controlHook = null, TrainingState? state = null)
         {
+            if (opts.Steps < 1)
+                throw new ArgumentException("Steps must be >= 1.", nameof(opts));
+            if (!float.IsFinite(opts.MaxLr) || opts.MaxLr <= 0f)
+                throw new ArgumentException("MaxLr must be finite and > 0.", nameof(opts));
+            if (!float.IsFinite(opts.MinLr) || opts.MinLr < 0f || opts.MinLr > opts.MaxLr)
+                throw new ArgumentException("MinLr must be finite and in [0, MaxLr].", nameof(opts));
+            if (opts.WarmupSteps < 0 || opts.WarmupSteps >= opts.Steps)
+                throw new ArgumentException("WarmupSteps must be >= 0 and < Steps.", nameof(opts));
+            if (!float.IsFinite(opts.WeightDecay) || opts.WeightDecay < 0f)
+                throw new ArgumentException("WeightDecay must be finite and >= 0.", nameof(opts));
+            if (!float.IsFinite(opts.GradClip))
+                throw new ArgumentException("GradClip must be finite.", nameof(opts));
             if (val is null && opts.ValEvery != 0)
                 throw new ArgumentException("ValEvery is set but no val DataLoader was given.", nameof(val));
             if (opts.BatchSize < 1)
@@ -98,6 +110,8 @@ namespace LLM.Core.Training
             if (opts.ValBatches < 1)
                 throw new ArgumentException("ValBatches must be >= 1.", nameof(opts));
             int ctx = opts.ContextLength > 0 ? opts.ContextLength : model.Config.ContextLength;
+            if (ctx > model.Config.ContextLength)
+                throw new ArgumentException("ContextLength cannot exceed the model context length.", nameof(opts));
             int batch = opts.BatchSize;
             int accumulation = opts.AccumulationSteps;
             state ??= TrainingState.CreateNew(model.Backend, opts);

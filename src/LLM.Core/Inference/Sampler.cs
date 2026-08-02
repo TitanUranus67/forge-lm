@@ -28,6 +28,10 @@ namespace LLM.Core.Inference
         /// </summary>
         public static int Sample(ReadOnlySpan<float> logits, float temperature, int topK, Random rng)
         {
+            if (logits.IsEmpty) throw new ArgumentException("Need at least one logit.", nameof(logits));
+            ArgumentNullException.ThrowIfNull(rng);
+            if (!float.IsFinite(temperature))
+                throw new ArgumentException("Temperature must be finite.", nameof(temperature));
             if (temperature <= 0f) return Greedy(logits);
             int v = logits.Length;
 
@@ -74,7 +78,13 @@ namespace LLM.Core.Inference
         public static IEnumerable<int> Generate(GptModel model, IReadOnlyList<int> promptTokens,
             int maxNewTokens, float temperature, int topK, Random rng, int? eosId = null)
         {
+            ArgumentNullException.ThrowIfNull(model);
+            ArgumentNullException.ThrowIfNull(promptTokens);
+            ArgumentNullException.ThrowIfNull(rng);
             if (promptTokens.Count == 0) throw new ArgumentException("Need at least one prompt token.");
+            if (maxNewTokens < 0) throw new ArgumentOutOfRangeException(nameof(maxNewTokens));
+            if (eosId is int validatedEos && (uint)validatedEos >= (uint)model.Config.VocabSize)
+                throw new ArgumentOutOfRangeException(nameof(eosId), "EOS token must be inside the model vocabulary.");
             var window = new List<int>(promptTokens);
             for (int n = 0; n < maxNewTokens; n++)
             {
