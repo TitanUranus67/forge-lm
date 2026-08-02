@@ -20,7 +20,7 @@ namespace LLM.Core.Tensor;
 /// steady-state calls do not allocate; the copy is O(MK+KN+MN) against the
 /// O(M*N*K) compute it enables.
 /// </remarks>
-public sealed class CpuBackend : ITensorBackend
+public class CpuBackend : ITensorBackend
 {
     private static readonly float GeluC = MathF.Sqrt(2f / MathF.PI); // sqrt(2/pi)
     private const float GeluCoeff = 0.044715f;

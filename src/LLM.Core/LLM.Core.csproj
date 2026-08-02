@@ -4,14 +4,32 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <!-- ComputeSharp shader source generators emit unsafe code -->
+    <!-- ComputeSharp shader source generators emit unsafe code on Windows builds. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <!-- ComputeSharp's D3D12 interop is Windows-only; the rest of the library stays cross-platform -->
+    <!-- ComputeSharp's D3D12 interop is Windows-only; the rest of the library stays cross-platform. -->
     <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <!-- A RID-specific publish follows the target platform; ordinary builds follow
+         the host. This keeps Windows D3D12 available locally while ensuring a
+         linux-x64 publish never carries ComputeSharp's Windows-only generator. -->
+    <EnableD3D12Backend>$([MSBuild]::IsOSPlatform('Windows'))</EnableD3D12Backend>
+    <EnableD3D12Backend Condition="'$(RuntimeIdentifier)' != ''">$([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win'))</EnableD3D12Backend>
   </PropertyGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="'$(EnableD3D12Backend)' == 'true'">
     <PackageReference Include="ComputeSharp" Version="3.2.0" />
+    <Compile Remove="Tensor/Gpu/GpuBackend.NonWindows.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ILGPU" Version="1.5.3" />
+    <PackageReference Include="ILGPU.Algorithms" Version="1.5.3" />
+  </ItemGroup>
+
+  <!-- ComputeSharp's generator loads Windows DLLs at compile time. Linux builds use
+       the CUDA backend and compile only a fail-loud D3D12 placeholder. -->
+  <ItemGroup Condition="'$(EnableD3D12Backend)' != 'true'">
+    <Compile Remove="Tensor/Gpu/**/*.cs" />
+    <Compile Include="Tensor/Gpu/GpuBackend.NonWindows.cs" />
   </ItemGroup>
 
 </Project>

@@ -1,5 +1,7 @@
 # Plan: ILGPU (CUDA) backend + safe automatic selection
 
+**Status: implemented and validated on Windows CUDA and Linux CUDA (RTX 2080).**
+
 ## Goal
 Add a third tensor backend, `CudaBackend`, built on ILGPU (C# → CUDA PTX JIT), so the
 project runs on Linux/NVIDIA cloud GPUs (vast.ai et al.). Add an `auto` selection mode
@@ -7,9 +9,10 @@ that prefers CUDA on this machine only if it benches ≥ the D3D12 `GpuBackend`,
 always falling back to D3D12 or CPU when CUDA is unavailable.
 
 ## Key facts (verified)
-- **ILGPU 1.5.3** (NuGet, MIT) targets .NET Standard 2.1 / .NET 5+ → works on net9.0.
-  One package only. **NOT** ILGPU.Algorithms — it has known device-compat issues on
-  newer cards (RTX 40-series) and we already have our own reductions.
+- **ILGPU 1.5.3** and **ILGPU.Algorithms 1.5.3** target .NET Standard 2.1 / .NET 5+
+  and work on net9.0. Algorithms is required to register CUDA implementations for
+  `Exp`, `Log`, `Sqrt`, and `Tanh`; the first runtime compilation proved that the
+  original one-package assumption was incorrect. Reductions remain project-owned.
 - NuGet restore on this machine needs `--source https://api.nuget.org/v3/index.json`
   (flaky private feed).
 - Kernel inventory to port (28 public methods on `GpuBackend`): 19 `ITensorBackend`
@@ -32,7 +35,7 @@ always falling back to D3D12 or CPU when CUDA is unavailable.
 
 ## Milestone 1 — Scaffolding + allocator + trivial kernels
 New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
-1. Add ILGPU 1.5.3 to LLM.Core only (`dotnet add src/LLM.Core package ILGPU --version 1.5.3 --source https://api.nuget.org/v3/index.json`).
+1. Add ILGPU 1.5.3 and ILGPU.Algorithms 1.5.3 to LLM.Core only.
 2. `CudaBackend : ITensorBackend, IDisposable`: Context + CudaAccelerator(0), one
    accelerator stream, device name/memory properties.
 3. Port the allocator: same bucketed arena design over `MemoryBuffer1D<float>`
@@ -43,21 +46,21 @@ New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
    kernels leave device authoritative, downloads on demand).
 5. Trivial kernels first (Fill/Zero, Copy, CopyBlock, AddInPlace, Scale, Transpose) +
    `tests/LLM.Core.Tests/CudaBackendTests.cs` with skip-if-no-CUDA and the first
-   kernel-vs-CPU comparisons. All existing 87 tests keep passing.
+   kernel-vs-CPU comparisons.
 
 ## Milestone 2 — Full kernel port + validation
-1. Elementwise/reduction kernels: AddBias, SumRows (atomics), GeluForward/Backward,
-   EmbeddingForward, EmbeddingBackward (CAS scatter), CausalMask, SoftmaxForward/
-   Backward (one thread/row), LayerNorm fwd/bwd, SumSquares, CrossEntropy fwd/bwd —
+1. Elementwise/reduction kernels: AddBias, SumRows, GeluForward/Backward,
+   EmbeddingForward, EmbeddingBackward (atomic scatter), CausalMask, SoftmaxForward/
+   Backward (one 256-thread group/row), LayerNorm fwd/bwd, SumSquares, CrossEntropy fwd/bwd —
    preserving the **in-place aliasing contract** (CE probs/dLogits may alias logits;
    target logit captured before writes; elementwise backward).
 2. Matmul NN/NT/TN: tiled 16×16 with group-shared memory (port the D3D12 shader
    logic directly), plus BatchedMatMulNN/NT/TN and PackHeads/UnpackHeads for attention.
 3. AdamWStep + Zero on device.
-4. Mirror the GPU test suite into CudaBackendTests: every kernel vs CpuBackend
+4. Reuse the GPU numerical contract from CudaBackendTests: every kernel vs CpuBackend
    (same tolerances), residency tests (incl. the stale-without-invalidate behavior),
    CE aliasing, BucketOf property test, full-model batched gradient check (tiny config),
-   200-step overfit smoke. Suite: 87 + ~16 = 103+ tests, ALL PASSED, 0 warnings.
+   200-step overfit smoke. Suite: 95 tests, ALL PASSED, 0 warnings.
 
 ## Milestone 3 — CLI + bench gate
 1. `--backend auto|cpu|gpu|cuda` on train/generate/chat (default stays `cpu` until M4);
@@ -85,16 +88,18 @@ New: `src/LLM.Core/Tensor/Cuda/{CudaBackend.cs,CudaKernels.cs}`.
 
 ## Explicit non-goals / follow-ups
 - No fp16/TF32/tensor cores (fp32 throughout, like the rest of the project).
-- No ILGPU.Algorithms, no multi-GPU, no OpenCL path (CUDA only; OpenCL is a maybe-later).
-- vast.ai deployment is a FOLLOW-UP after this lands: linux-x64 publish, driver check,
-  `prepare-fineweb` on-instance or upload bins, interruptible-instance checkpoint loop.
-  Not part of this plan, but this plan is the unblock for it.
+- No multi-GPU or OpenCL path (CUDA only; OpenCL is a maybe-later).
+- Linux publishing and an interruptible cloud-resume checklist are documented in
+  `docs/linux-cuda.md`.
 - Guard: before starting, verify no other agent/process is editing the tree (a wedged
   background agent caused file-lock chaos earlier in this project).
 
 ## Verification per milestone
-- M1: 87 + new trivial-kernel tests green.
-- M2: full suite (103+) green incl. cuda gradient check + overfit.
-- M3: bench numbers reported (cpu/gpu/cuda), plateau confirmed.
-- M4: suite green, commit made, fresh commands with no `--backend` select the fastest
-  available validated backend and still run on a CPU-only host.
+- M1/M2: complete; all CUDA kernels, synchronization, gradients, overfit, AdamW,
+  reductions, and allocator behavior pass on a real device.
+- M3: CUDA train/generate/checkpoint smoke paths and allocator plateau pass on both
+  Windows and Linux. The 100-step 110M RTX 2080 gate measured CUDA at 1,002 tok/s
+  and D3D12 at 922 tok/s (CUDA 1.087x D3D12), with matching losses; CUDA-first auto
+  selection therefore clears the required 0.95x gate.
+- M4: automatic selection and injectable CPU-only/fallback tests are complete; explicit
+  accelerator requests remain fail-loud.

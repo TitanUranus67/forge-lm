@@ -1,7 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
-    <ProjectReference Include="..\LLM.Core\LLM.Core.csproj" />
+    <ProjectReference Include="..\LLM.Core\LLM.Core.csproj">
+      <!-- ProjectReference strips RuntimeIdentifier for framework-dependent
+           inner builds. Forward the Linux source choice explicitly so a
+           Windows-hosted linux-x64 publish does not compile D3D12 shaders. -->
+      <AdditionalProperties Condition="'$(RuntimeIdentifier)' != '' and !$([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win'))">EnableD3D12Backend=false</AdditionalProperties>
+    </ProjectReference>
   </ItemGroup>
 
   <ItemGroup>

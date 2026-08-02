@@ -6,6 +6,7 @@ using LLM.Core.Checkpoint;
 using LLM.Core.Inference;
 using LLM.Core.Model;
 using LLM.Core.Tensor;
+using LLM.Core.Tensor.Cuda;
 using LLM.Core.Tensor.Gpu;
 using LLM.Core.Tokenizer;
 using LLM.Core.Training;
@@ -61,40 +62,60 @@ internal static partial class Cli
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
                         [--valbatches 50] [--valseed 424242]
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
-                        [--resume-step N] [--backend cpu|gpu]
+                        [--resume-step N] [--backend auto|cpu|gpu|cuda]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
-                        [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend cpu|gpu]
+                        [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
           llm chat      --model <checkpoint> --tokenizer <dir-or-path>
-                        [--tokens 100] [--temperature 0.8] [--topk 40] [--seed 1] [--backend cpu|gpu]
+                        [--tokens 100] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
 
         There is no separate train-tokenizer command: tokenizer training is folded
         into `prepare` (use --tokenizer to supply a pre-trained one).
-        --backend gpu runs all tensor math on the default D3D12 device (ComputeSharp);
-        the default is cpu. Run any command with --help for details.
+        --backend cuda runs on an NVIDIA GPU through ILGPU (Linux or Windows);
+        --backend gpu selects Windows D3D12. The default auto mode prefers CUDA,
+        then D3D12 on Windows, and always falls back to CPU.
         """);
 
-    /// <summary>Creates the tensor backend for --backend cpu|gpu and prints the selection.</summary>
+    /// <summary>Creates the requested tensor backend and prints the actual selection.</summary>
     private static ITensorBackend CreateBackend(string name)
     {
-        if (name.Equals("cpu", StringComparison.OrdinalIgnoreCase))
+        BackendSelection.Choice<ITensorBackend> choice;
+        try
         {
-            Console.WriteLine("backend: cpu");
-            return new CpuBackend();
-        }
-        if (name.Equals("gpu", StringComparison.OrdinalIgnoreCase))
-        {
-            try
+            choice = BackendSelection.Create<ITensorBackend>(name, OperatingSystem.IsWindows(), candidate => candidate switch
             {
-                var gpu = new GpuBackend();
+                "cpu" => new CpuBackend(),
+                "gpu" => new GpuBackend(),
+                "cuda" => new CudaBackend(),
+                _ => throw new InvalidOperationException($"unexpected backend candidate '{candidate}'"),
+            }, (candidate, ex) =>
+            {
+                if (candidate == "cuda" && CudaBackend.IsAvailable)
+                    Console.Error.WriteLine($"warning: CUDA was detected but initialization failed; auto is falling back: {ex.Message}");
+            });
+        }
+        catch (Exception ex) when (name.Equals("gpu", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException($"--backend gpu requested, but no D3D12 device is available: {ex.Message}", ex);
+        }
+        catch (Exception ex) when (name.Equals("cuda", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException($"--backend cuda requested, but no CUDA device is available: {ex.Message}", ex);
+        }
+
+        switch (choice.Value)
+        {
+            case CudaBackend cuda:
+                Console.WriteLine($"backend: cuda ({cuda.DeviceName}, {cuda.DeviceMemoryBytes / 1e9:F1} GB)");
+                break;
+            case GpuBackend gpu:
                 Console.WriteLine($"backend: gpu ({gpu.DeviceName}, {gpu.DeviceMemoryBytes / 1e9:F1} GB)");
-                return gpu;
-            }
-            catch (Exception ex)
-            {
-                throw new ArgumentException($"--backend gpu requested, but no D3D12 device is available: {ex.Message}");
-            }
+                break;
+            default:
+                Console.WriteLine(choice.Name == "cpu" && name.Equals("auto", StringComparison.OrdinalIgnoreCase)
+                    ? "backend: cpu (auto fallback)" : "backend: cpu");
+                break;
         }
-        throw new ArgumentException($"unknown backend '{name}' (expected cpu or gpu)");
+        return choice.Value;
     }
 
     // ---- prepare -------------------------------------------------------------
@@ -219,7 +240,8 @@ internal static partial class Cli
                   only; --resume-step N can supply their known cumulative scheduler
                   position during the one-time upgrade. Architecture flags are ignored
                   when loading. --saveevery N writes the checkpoint every N global
-                  steps. --backend gpu runs training on the default D3D12 device.
+                  steps. --backend cuda runs on NVIDIA CUDA (including Linux);
+                  --backend gpu runs on Windows D3D12, and auto chooses safely.
                   Ctrl+C stops after the current step and still saves.
                   --accum N averages N physical batches before each Adam/LR step.
                   --tokens and --warmup-tokens convert token budgets into optimizer
@@ -252,7 +274,7 @@ internal static partial class Cli
         string? init = p.Get("init");
         int resumeStep = p.GetInt("resume-step", 0);
         int saveevery = p.GetInt("saveevery", 0);
-        string backendName = p.Get("backend", "cpu");
+        string backendName = p.Get("backend", "auto");
         p.Done();
 
         if (stepsArg is not null && tokensArg is not null)
@@ -435,7 +457,7 @@ internal static partial class Cli
         float temperature = p.GetFloat("temperature", 0.8f);
         int topk = p.GetInt("topk", 40);
         int seed = p.GetInt("seed", 1);
-        string backendName = p.Get("backend", "cpu");
+        string backendName = p.Get("backend", "auto");
         p.Done();
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;
@@ -499,7 +521,7 @@ internal static partial class Cli
         float temperature = p.GetFloat("temperature", 0.8f);
         int topk = p.GetInt("topk", 40);
         int seed = p.GetInt("seed", 1);
-        string backendName = p.Get("backend", "cpu");
+        string backendName = p.Get("backend", "auto");
         p.Done();
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;

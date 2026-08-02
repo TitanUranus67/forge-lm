@@ -1,10 +1,10 @@
 # LLM_Scratch
 
 A mini-GPT built from scratch in C# (.NET 9). Everything (BPE tokenizer,
-transformer, AdamW, SIMD tensor backend, checkpoint format) is implemented on
-top of the Base Class Library. The core library has exactly one NuGet
-dependency: [ComputeSharp](https://github.com/Sergio0694/ComputeSharp) 3.2.0,
-which powers the optional D3D12 GPU backend. The CLI additionally uses
+transformer, AdamW, SIMD tensor backend, checkpoint format) is implemented in
+C#. [ComputeSharp](https://github.com/Sergio0694/ComputeSharp) powers the
+optional Windows D3D12 backend; [ILGPU](https://github.com/m4rs-mt/ILGPU)
+powers the NVIDIA CUDA backend on Linux and Windows. The CLI additionally uses
 [Parquet.Net](https://github.com/aloneguid/parquet-dotnet) to read FineWeb
 parquet shards for `prepare-fineweb`.
 
@@ -12,7 +12,7 @@ parquet shards for `prepare-fineweb`.
 
 ```sh
 dotnet build
-dotnet run --project tests/LLM.Core.Tests   # 87 tests (GPU tests skip cleanly without a D3D12 device)
+dotnet run --project tests/LLM.Core.Tests   # CUDA/D3D12 tests skip cleanly when unavailable
 ```
 
 ## Quickstart
@@ -30,7 +30,10 @@ dotnet run --project src/LLM.Cli -- prepare-fineweb --out data/fineweb --shards 
 # 2. Train a small GPT (checkpoint written to out/model.bin)
 dotnet run --project src/LLM.Cli -- train --data data/shakes --steps 5000 --out out/model.bin
 
-# 2b. Or train on the GPU (D3D12 compute shaders)
+# 2b. Explicit NVIDIA CUDA (Linux or Windows)
+dotnet run --project src/LLM.Cli -- train --data data/shakes --steps 5000 --out out/model.bin --backend cuda
+
+# 2c. Explicit Windows D3D12 compute shaders
 dotnet run --project src/LLM.Cli -- train --data data/shakes --steps 5000 --out out/model.bin --backend gpu
 
 # 3. Generate text from the checkpoint
@@ -44,7 +47,9 @@ dotnet run --project src/LLM.Cli -- chat --model out/model.bin --tokenizer data/
 All flags are optional where a default exists; run any command with `--help` for
 the full list (model size, learning-rate schedule, sampling knobs, resuming from
 a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
-`--backend cpu|gpu` (default `cpu`); the selected backend is printed at startup.
+`--backend auto|cpu|gpu|cuda` (default `auto`). Auto tries CUDA first, then
+D3D12 on Windows, and always falls back to CPU. Explicit accelerator choices
+fail loudly if unavailable. The selected backend and device are printed at startup.
 
 - `prepare` accepts a local file or an http(s) URL (default: tiny-shakespeare),
   trains or loads a tokenizer (`tokenizer.json`), encodes the corpus, and writes
@@ -116,7 +121,7 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   the matmul inner loops. Large matmuls parallelize over output rows with
   `Parallel.For` and pooled buffers (no steady-state allocation); small ones
   run sequentially.
-- **GPU backend** (`Tensor/Gpu/`) — a second `ITensorBackend` implementation
+- **D3D12 backend** (`Tensor/Gpu/`) — a second `ITensorBackend` implementation
   running D3D12 compute shaders written in C# via ComputeSharp (Windows only;
   the rest of the library stays cross-platform). One shader per kernel, fp32
   throughout; matmuls use 16×16 groupshared tiles (~950 GFLOPS on an RTX 2080
@@ -131,6 +136,13 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   authoritative until `EnsureHostCurrent`), and host-side writes (optimizer,
   gradient clipping, checkpoint load) must call `InvalidateDeviceCache`.
   Measured at GPT-1 scale (dmodel 768, 12 layers, ctx 512, batch 8): see below.
+- **CUDA backend** (`Tensor/Cuda/`) — an ILGPU implementation for NVIDIA GPUs
+  on Linux and Windows. It covers the complete training interface: tiled fp32
+  matmuls, batched attention, normalization, softmax/cross-entropy, embedding
+  scatter atomics, AdamW, gradient reductions, and host/device synchronization.
+  Tensor storage is sub-allocated from reusable 64 MB CUDA arenas and remains
+  device-resident; tests enforce numerical agreement with CPU, full-model
+  gradients, overfit behavior, aliasing, and a steady-state allocation plateau.
 - **Checkpoints** (`Checkpoint/Checkpoint.cs`) — versioned custom binary format.
   `LLMSCRATCH1` is the legacy model-only format. `LLMSCRATCH2` adds cumulative step,
   schedule/configuration, sampler RNG, Adam age, and first/second moment tensors to
@@ -138,9 +150,12 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
   Loading validates the exact payload size and parameter registry.
   Checkpoints are backend-agnostic: train on GPU, generate on CPU or vice versa.
 
-## GPU backend notes
+## Accelerator backend notes
 
-- Requires Windows with a D3D12 device (any recent NVIDIA/AMD/Intel driver;
+- `--backend cuda` requires an NVIDIA driver visible to the process and works
+  on Linux or Windows. ILGPU JIT-compiles the C# kernels to CUDA PTX at backend
+  startup, so the first launch takes longer than subsequent operations.
+- `--backend gpu` requires Windows with a D3D12 device (any recent NVIDIA/AMD/Intel driver;
   WARP software devices also work for correctness testing). Without one, the
   GPU tests skip and `--backend gpu` exits with a clear error.
 - Runtime: the ComputeSharp source generators rely on `[UnsafeAccessor]`,
@@ -151,6 +166,14 @@ a checkpoint with `--init`, etc.). `train`, `generate` and `chat` accept
 - Reference throughput on an RTX 2080 8 GB, GPT-1 scale
   (`--dmodel 768 --layers 12 --heads 12 --ctx 512 --batch 8`, 4096 tokens/step):
   CPU ≈ 100 tok/s, GPU ≈ 950 tok/s (~9×). Device memory usage is ~5.5 GB.
+- A controlled 100-step RTX 2080 comparison at the current 110M shape
+  (`768/12/12`, ctx 512, batch 4, fp32) reached 1,002 tok/s with CUDA versus
+  922 tok/s with D3D12. Loss and validation values matched at every logged gate.
+- Checkpoints are backend-agnostic, so a checkpoint created by the D3D12 or CPU
+  backend can resume directly under CUDA on a Linux server.
+
+For a self-contained Linux publish and cloud resume checklist, see
+[docs/linux-cuda.md](docs/linux-cuda.md).
 
 ## Project layout
 

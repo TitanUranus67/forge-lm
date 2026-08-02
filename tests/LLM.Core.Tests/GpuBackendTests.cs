@@ -17,15 +17,17 @@ namespace LLM.Core.Tests
     {
         private static readonly CpuBackend Cpu = new();
         private static GpuBackend? _gpu;
+        private static ITensorBackend? _overrideBackend;
         private static bool _probed;
 
         private const float FwdTol = 1e-4f;  // forward kernels
         private const float BwdTol = 1e-2f;  // backward kernels (reduction order differs)
 
-        private static GpuBackend? Gpu
+        private static ITensorBackend? Gpu
         {
             get
             {
+                if (_overrideBackend is not null) return _overrideBackend;
                 if (!_probed)
                 {
                     _probed = true;
@@ -40,6 +42,15 @@ namespace LLM.Core.Tests
                 }
                 return _gpu;
             }
+        }
+
+        /// <summary>Runs the numerical contract methods against another device backend.</summary>
+        internal static void RunWithBackend(ITensorBackend backend, Action tests)
+        {
+            if (_overrideBackend is not null) throw new InvalidOperationException("A backend contract run is already active.");
+            _overrideBackend = backend;
+            try { tests(); }
+            finally { _overrideBackend = null; }
         }
 
         /// <summary>Reports SKIP and returns true when there is no D3D12 device.</summary>
@@ -97,7 +108,7 @@ namespace LLM.Core.Tests
         public static void MatMul_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(101);
 
             foreach ((int M, int K, int N) in new[] { (37, 53, 29), (128, 256, 192) })
@@ -134,7 +145,7 @@ namespace LLM.Core.Tests
         public static void Elementwise_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(102);
             const int rows = 33, cols = 65;
 
@@ -195,7 +206,7 @@ namespace LLM.Core.Tests
         public static void FlatDispatch_BeyondOneDimensionalLimit()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             // 64 threads/group * 65535 groups = 4,194,240 max 1-D dispatch; exceed it.
             const int n = 5_000_123;
             var rng = new Random(103);
@@ -213,7 +224,7 @@ namespace LLM.Core.Tests
         public static void LayerNorm_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(104);
             const int rows = 33, cols = 64;
             const float eps = 1e-5f;
@@ -247,7 +258,7 @@ namespace LLM.Core.Tests
         public static void Softmax_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(105);
             const int rows = 29, cols = 257; // odd width, larger than one warp
 
@@ -270,7 +281,7 @@ namespace LLM.Core.Tests
         public static void Gelu_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(106);
             const int n = 10_003;
             float[] x = Rand(n, rng, 2f);
@@ -295,7 +306,7 @@ namespace LLM.Core.Tests
         public static void Embedding_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(107);
             const int V = 51, D = 37, Tn = 96;
 
@@ -321,7 +332,7 @@ namespace LLM.Core.Tests
         public static void CausalMask_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(108);
             const int T = 47;
             float[] s = Rand(T * T * 3, rng); // three packed [T,T] blocks (batched attention)
@@ -345,7 +356,7 @@ namespace LLM.Core.Tests
         public static void CrossEntropy_MatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(109);
             const int T = 61, V = 389, ignore = -1;
 
@@ -405,7 +416,7 @@ namespace LLM.Core.Tests
         public static void CrossEntropy_AliasedInPlaceMatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(110);
             const int T = 61, V = 389, ignore = -1;
 
@@ -435,7 +446,7 @@ namespace LLM.Core.Tests
         public static void BatchedAttentionKernels_MatchCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(113);
             const int batch = 3, T = 7, H = 2, hd = 5, D = H * hd;
 
@@ -487,7 +498,7 @@ namespace LLM.Core.Tests
         public static void Residency_DirectHostWriteWithoutInvalidateIsStale()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(110);
             const int n = 128;
             float[] a = Rand(n, rng), b = Rand(n, rng);
@@ -505,7 +516,7 @@ namespace LLM.Core.Tests
         public static void Residency_InvalidateRefreshesDeviceCopy()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(111);
             const int n = 128;
             float[] a = Rand(n, rng), b = Rand(n, rng);
@@ -526,7 +537,7 @@ namespace LLM.Core.Tests
         public static void EnsureHostCurrent_RoundTripsDeviceResults()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var rng = new Random(112);
             const int n = 256;
             float[] a = Rand(n, rng), b = Rand(n, rng);
@@ -554,7 +565,7 @@ namespace LLM.Core.Tests
         public static void Model_ForwardMatchesCpu()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var config = Tiny;
             int[] tokens = { 3, 1, 4, 1, 5, 2 };
             Tensor cpuLogits = new GptModel(config, Cpu, new Random(42)).Forward(tokens);
@@ -566,7 +577,7 @@ namespace LLM.Core.Tests
         public static void Model_GradientCheck_Batched()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var config = Tiny;
             var model = new GptModel(config, gpu, new Random(123));
             const int batch = 2;
@@ -625,7 +636,7 @@ namespace LLM.Core.Tests
         public static void Overfit_SmallBatchLossDrops()
         {
             if (Skip()) return;
-            GpuBackend gpu = Gpu!;
+            ITensorBackend gpu = Gpu!;
             var config = Tiny;
             var model = new GptModel(config, gpu, new Random(5));
             const int batch = 2;
