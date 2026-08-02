@@ -65,8 +65,8 @@ namespace LLM.Core.Training
     {
         /// <summary>
         /// Trains <paramref name="model"/> in place. <paramref name="onLog"/> is
-        /// invoked at step 0 and then every <see cref="TrainOptions.LogEvery"/>
-        /// steps; a val loss (averaged over a fixed set of
+        /// invoked at the first step, every <see cref="TrainOptions.LogEvery"/>
+        /// steps, and whenever validation is due; a val loss (averaged over a fixed set of
         /// <see cref="TrainOptions.ValBatches"/> physical-size batches) is included
         /// every <see cref="TrainOptions.ValEvery"/> steps
         /// when a val loader is given. <paramref name="onSave"/> is invoked with the
@@ -89,6 +89,12 @@ namespace LLM.Core.Training
                 throw new ArgumentException("BatchSize must be >= 1.", nameof(opts));
             if (opts.AccumulationSteps < 1)
                 throw new ArgumentException("AccumulationSteps must be >= 1.", nameof(opts));
+            if (opts.LogEvery < 1)
+                throw new ArgumentException("LogEvery must be >= 1.", nameof(opts));
+            if (opts.ValEvery < 0)
+                throw new ArgumentException("ValEvery must be >= 0.", nameof(opts));
+            if (opts.SaveEvery < 0)
+                throw new ArgumentException("SaveEvery must be >= 0.", nameof(opts));
             if (opts.ValBatches < 1)
                 throw new ArgumentException("ValBatches must be >= 1.", nameof(opts));
             int ctx = opts.ContextLength > 0 ? opts.ContextLength : model.Config.ContextLength;
@@ -143,13 +149,15 @@ namespace LLM.Core.Training
 
                 if (controlHook?.Invoke(step + 1) == TrainCommand.SaveAndQuit) break;
 
-                if (step == 0 || (step + 1) % opts.LogEvery == 0 || step + 1 == opts.Steps)
+                bool shouldLog = step == 0 || (step + 1) % opts.LogEvery == 0 || step + 1 == opts.Steps;
+                bool shouldValidate = val is not null && opts.ValEvery > 0 &&
+                    (step == 0 || (step + 1) % opts.ValEvery == 0 || step + 1 == opts.Steps);
+                if (shouldLog || shouldValidate)
                 {
                     float? valLoss = null;
-                    if (val is not null && opts.ValEvery > 0 &&
-                        (step == 0 || (step + 1) % opts.ValEvery == 0 || step + 1 == opts.Steps))
+                    if (shouldValidate)
                     {
-                        valLoss = EvalLoss(model, val, ctx, batch, opts.ValBatches, opts.ValSeed);
+                        valLoss = EvalLoss(model, val!, ctx, batch, opts.ValBatches, opts.ValSeed);
                         lastVal = valLoss.Value;
                     }
                     onLog?.Invoke(new TrainLog(step + 1, lr, lastTrain, valLoss, sw.Elapsed));

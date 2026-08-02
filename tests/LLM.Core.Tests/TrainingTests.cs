@@ -253,6 +253,41 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void Validation_CadenceIsIndependentOfLogging()
+        {
+            string path = WriteRepetitiveTokens(2048);
+            try
+            {
+                var model = new GptModel(Small, B, new Random(41));
+                var options = new TrainOptions
+                {
+                    Steps = 7,
+                    MaxLr = 1e-3f,
+                    MinLr = 1e-4f,
+                    WarmupSteps = 1,
+                    ContextLength = Small.ContextLength,
+                    BatchSize = 2,
+                    Seed = 7,
+                    LogEvery = 5,
+                    ValEvery = 3,
+                    ValBatches = 1,
+                };
+                var logs = new List<TrainLog>();
+                using var train = new DataLoader(path);
+                using var val = new DataLoader(path);
+
+                Trainer.Train(model, train, val, options, logs.Add);
+
+                int[] validationSteps = logs.Where(l => l.ValLoss.HasValue).Select(l => l.Step).ToArray();
+                Check.True(validationSteps.SequenceEqual(new[] { 1, 3, 6, 7 }),
+                    $"validation steps [{string.Join(",", validationSteps)}] follow ValEvery independently");
+                Check.True(logs.Any(l => l.Step == 5 && !l.ValLoss.HasValue),
+                    "regular logging still occurs between validation events");
+            }
+            finally { File.Delete(path); }
+        }
+
+        [Test]
         public static void GradientAccumulation_MatchesEquivalentLargeBatch()
         {
             string path = WriteRepetitiveTokens(2048);
