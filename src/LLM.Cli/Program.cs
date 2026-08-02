@@ -598,6 +598,9 @@ internal static partial class Cli
         public float? GetFloat(string key) =>
             Take(key) is string v ? float.Parse(v, CultureInfo.InvariantCulture) : null;
 
+        public bool GetBool(string key, bool fallback) =>
+            Take(key) is string v ? bool.Parse(v) : fallback;
+
         public void Done()
         {
             if (Help) return;
