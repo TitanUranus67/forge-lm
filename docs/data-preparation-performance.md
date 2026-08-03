@@ -50,7 +50,7 @@ The implementation parallelizes document tokenization while preserving byte-for-
 - Real-corpus benchmark results on the Ryzen 7 5800XT were 10.0 MB/s with four
   workers, 12.9-13.3 MB/s with eight, and 11.9-12.0 MB/s with sixteen, versus the
   3.5-3.7 MB/s sequential baseline. Eight workers won at about 3.6x baseline and
-  should encode this corpus in roughly 13-14 minutes.
+  completed this corpus in 14 minutes 21 seconds at approximately 12.1 MB/s.
 
 Parallelizing tokenizer merge training is a distinct, more difficult optimization
 because merge selection depends on global pair counts after every iteration. Treat
