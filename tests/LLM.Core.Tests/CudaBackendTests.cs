@@ -1,7 +1,10 @@
 namespace LLM.Core.Tests;
 
+using LLM.Core.Checkpoint;
+using LLM.Core.Model;
 using LLM.Core.Tensor;
 using LLM.Core.Tensor.Cuda;
+using LLM.Core.Training;
 using Tensor = LLM.Core.Tensor.Tensor;
 
 /// <summary>CUDA-specific validation plus the complete device-backend numerical contract.</summary>
@@ -53,6 +56,101 @@ public static class CudaBackendTests
             GpuBackendTests.Model_GradientCheck_Batched();
             GpuBackendTests.Overfit_SmallBatchLossDrops();
         });
+    }
+
+    [Test]
+    public static void CuBlasFp32_MatmulsAndModelMatchCpu()
+    {
+        if (Skip()) return;
+        using var cuda = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasFp32);
+        Check.True(cuda.MatMulMode == CudaMatMulMode.CuBlasFp32, "cuBLAS FP32 mode is active");
+        GpuBackendTests.RunWithBackend(cuda, () =>
+        {
+            GpuBackendTests.MatMul_MatchesCpu();
+            GpuBackendTests.BatchedAttentionKernels_MatchCpu();
+            GpuBackendTests.Model_ForwardMatchesCpu();
+            GpuBackendTests.Model_GradientCheck_Batched();
+            GpuBackendTests.Overfit_SmallBatchLossDrops();
+        });
+    }
+
+    [Test]
+    public static void Tf32_RequiresAmpereOrNewer()
+    {
+        if (Skip()) return;
+        if (Cuda!.SupportsTf32)
+        {
+            using var tf32 = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasTf32);
+            Check.True(tf32.MatMulMode == CudaMatMulMode.CuBlasTf32, "TF32 mode is active");
+            return;
+        }
+
+        try
+        {
+            using var unexpected = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasTf32);
+            Check.Fail("pre-Ampere CUDA device accepted TF32 mode");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Check.True(ex.InnerException is NotSupportedException,
+                "pre-Ampere TF32 rejection reports NotSupportedException");
+        }
+    }
+
+    [Test]
+    public static void CustomCheckpoint_ResumesWithCuBlasFp32()
+    {
+        if (Skip()) return;
+        string dataPath = Path.GetTempFileName();
+        string checkpointPath = Path.GetTempFileName();
+        try
+        {
+            const int vocab = 32, context = 8;
+            using (var writer = new BinaryWriter(File.Create(dataPath)))
+                for (int i = 0; i < 2048; i++) writer.Write((ushort)(i % vocab));
+
+            var options = new TrainOptions
+            {
+                Steps = 2,
+                MaxLr = 1e-3f,
+                MinLr = 1e-4f,
+                WarmupSteps = 1,
+                WeightDecay = 0.1f,
+                GradClip = 1f,
+                ContextLength = context,
+                BatchSize = 2,
+                AccumulationSteps = 2,
+                Seed = 99,
+                LogEvery = 1,
+                ValEvery = 0,
+            };
+
+            using (var custom = new CudaBackend())
+            {
+                var model = new GptModel(new ModelConfig(vocab, context, 16, 2, 2), custom, new Random(42));
+                TrainingState state = TrainingState.CreateNew(custom, options);
+                using var data = new DataLoader(dataPath);
+                Trainer.Train(model, data, val: null, options,
+                    controlHook: step => step == 1 ? TrainCommand.SaveAndQuit : TrainCommand.Continue,
+                    state: state);
+                Checkpoint.SaveTraining(model, state, checkpointPath);
+            }
+
+            using var cuBlas = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasFp32);
+            Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(checkpointPath, cuBlas);
+            Check.True(loaded.TrainingState is not null, "custom checkpoint retains training state");
+            Check.True(loaded.TrainingState!.GlobalStep == 1, "custom checkpoint global step loads on cuBLAS");
+            Check.True(loaded.TrainingState.Optimizer.StepCount == 1, "custom checkpoint Adam state loads on cuBLAS");
+            using (var data = new DataLoader(dataPath))
+                Trainer.Train(loaded.Model, data, val: null, options, state: loaded.TrainingState);
+            Check.True(loaded.TrainingState.GlobalStep == 2, "cuBLAS resume reaches the stored target");
+            Check.True(loaded.TrainingState.Optimizer.StepCount == 2, "cuBLAS resume advances Adam state");
+        }
+        finally
+        {
+            File.Delete(dataPath);
+            File.Delete(checkpointPath);
+        }
     }
 
     [Test]

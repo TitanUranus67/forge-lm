@@ -63,10 +63,13 @@ internal static partial class Cli
                         [--valbatches 50] [--valseed 424242]
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
                         [--resume-step N] [--backend auto|cpu|gpu|cuda]
+                        [--matmul-precision custom|fp32|tf32]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
+                        [--matmul-precision custom|fp32|tf32]
           llm chat      --model <checkpoint> --tokenizer <dir-or-path>
                         [--tokens 100] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
+                        [--matmul-precision custom|fp32|tf32]
 
         There is no separate train-tokenizer command: tokenizer training is folded
         into `prepare` (use --tokenizer to supply a pre-trained one).
@@ -76,7 +79,7 @@ internal static partial class Cli
         """);
 
     /// <summary>Creates the requested tensor backend and prints the actual selection.</summary>
-    private static ITensorBackend CreateBackend(string name)
+    private static ITensorBackend CreateBackend(string name, CudaMatMulMode cudaMatMulMode = CudaMatMulMode.Custom)
     {
         BackendSelection.Choice<ITensorBackend> choice;
         try
@@ -85,7 +88,7 @@ internal static partial class Cli
             {
                 "cpu" => new CpuBackend(),
                 "gpu" => new GpuBackend(),
-                "cuda" => new CudaBackend(),
+                "cuda" => new CudaBackend(matMulMode: cudaMatMulMode),
                 _ => throw new InvalidOperationException($"unexpected backend candidate '{candidate}'"),
             }, (candidate, ex) =>
             {
@@ -102,10 +105,17 @@ internal static partial class Cli
             throw new ArgumentException($"--backend cuda requested, but no CUDA device is available: {ex.Message}", ex);
         }
 
+        if (cudaMatMulMode is not CudaMatMulMode.Custom && choice.Value is not CudaBackend)
+        {
+            if (choice.Value is IDisposable disposable) disposable.Dispose();
+            throw new ArgumentException("--matmul-precision fp32 or tf32 requires the CUDA backend.");
+        }
+
         switch (choice.Value)
         {
             case CudaBackend cuda:
-                Console.WriteLine($"backend: cuda ({cuda.DeviceName}, {cuda.DeviceMemoryBytes / 1e9:F1} GB)");
+                Console.WriteLine($"backend: cuda ({cuda.DeviceName}, {cuda.DeviceMemoryBytes / 1e9:F1} GB; " +
+                                  $"matmul {cuda.MatMulDescription})");
                 break;
             case GpuBackend gpu:
                 Console.WriteLine($"backend: gpu ({gpu.DeviceName}, {gpu.DeviceMemoryBytes / 1e9:F1} GB)");
@@ -117,6 +127,15 @@ internal static partial class Cli
         }
         return choice.Value;
     }
+
+    private static CudaMatMulMode ParseCudaMatMulMode(string value) => value.ToLowerInvariant() switch
+    {
+        "custom" => CudaMatMulMode.Custom,
+        "fp32" => CudaMatMulMode.CuBlasFp32,
+        "tf32" => CudaMatMulMode.CuBlasTf32,
+        _ => throw new ArgumentException(
+            $"Invalid --matmul-precision '{value}'. Expected custom, fp32, or tf32."),
+    };
 
     // ---- prepare -------------------------------------------------------------
 
@@ -242,6 +261,9 @@ internal static partial class Cli
                   when loading. --saveevery N writes the checkpoint every N global
                   steps. --backend cuda runs on NVIDIA CUDA (including Linux);
                   --backend gpu runs on Windows D3D12, and auto chooses safely.
+                  --matmul-precision custom keeps the original CUDA kernel; fp32
+                  selects strict cuBLAS SGEMM; tf32 explicitly enables NVIDIA TF32
+                  math and requires compute capability 8.0 or newer.
                   Ctrl+C stops after the current step and still saves.
                   --accum N averages N physical batches before each Adam/LR step.
                   --tokens and --warmup-tokens convert token budgets into optimizer
@@ -275,6 +297,7 @@ internal static partial class Cli
         int resumeStep = p.GetInt("resume-step", 0);
         int saveevery = p.GetInt("saveevery", 0);
         string backendName = p.Get("backend", "auto");
+        CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
         p.Done();
 
         if (stepsArg is not null && tokensArg is not null)
@@ -282,7 +305,7 @@ internal static partial class Cli
         if (warmupArg is not null && warmupTokensArg is not null)
             throw new ArgumentException("Use either --warmup or --warmup-tokens, not both.");
 
-        ITensorBackend backend = CreateBackend(backendName);
+        ITensorBackend backend = CreateBackend(backendName, cudaMatMulMode);
         GptModel model;
         TrainingState? trainState = null;
         if (init is not null)
@@ -458,11 +481,13 @@ internal static partial class Cli
         int topk = p.GetInt("topk", 40);
         int seed = p.GetInt("seed", 1);
         string backendName = p.Get("backend", "auto");
+        CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
         p.Done();
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;
         var tok = BpeTokenizer.Load(tokPath);
-        Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(modelPath, CreateBackend(backendName));
+        Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(
+            modelPath, CreateBackend(backendName, cudaMatMulMode));
         string tokenizerIdentity = ContentSha256(tokPath);
         if (loaded.TokenizerIdentity is not null && loaded.TokenizerIdentity != tokenizerIdentity)
             throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");
@@ -522,11 +547,13 @@ internal static partial class Cli
         int topk = p.GetInt("topk", 40);
         int seed = p.GetInt("seed", 1);
         string backendName = p.Get("backend", "auto");
+        CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
         p.Done();
 
         string tokPath = Directory.Exists(tokArg) ? Path.Combine(tokArg, "tokenizer.json") : tokArg;
         var tok = BpeTokenizer.Load(tokPath);
-        Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(modelPath, CreateBackend(backendName));
+        Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(
+            modelPath, CreateBackend(backendName, cudaMatMulMode));
         string tokenizerIdentity = ContentSha256(tokPath);
         if (loaded.TokenizerIdentity is not null && loaded.TokenizerIdentity != tokenizerIdentity)
             throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");

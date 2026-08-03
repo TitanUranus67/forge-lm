@@ -14,6 +14,10 @@ namespace LLM.Core.Tensor.Cuda;
 /// </summary>
 public sealed class CudaBackend : ITensorBackend, IDisposable
 {
+    // cublasMath_t value from CUDA: CUBLAS_TF32_TENSOR_OP_MATH. ILGPU 1.5.3
+    // supports cuBLAS v12 but its public enum predates this named member.
+    private const CuBlasMathMode Tf32TensorOpMath = (CuBlasMathMode)3;
+
     private const int ArenaFloats = 16 * 1024 * 1024;
     private const int DedicatedFloats = ArenaFloats / 2;
     private const int MinSplitFloats = 64 * 1024;
@@ -26,6 +30,8 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         LazyThreadSafetyMode.ExecutionAndPublication);
 
     private readonly CudaAccelerator _accelerator;
+    private readonly CudaMatMulMode _matMulMode;
+    private CuBlas? _cuBlas;
     private readonly object _gate = new();
     private readonly Dictionary<int, Stack<Chunk>> _freeChunks = new();
     private readonly List<(WeakReference<TensorValue> Owner, Entry Entry)> _entries = new();
@@ -80,16 +86,18 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         public Entry(Chunk storage) => Storage = storage;
     }
 
-    /// <summary>Creates a backend on CUDA device zero and compiles the kernel set.</summary>
-    public CudaBackend(int deviceIndex = 0)
+    /// <summary>Creates a backend on a CUDA device and compiles the kernel set.</summary>
+    public CudaBackend(int deviceIndex = 0, CudaMatMulMode matMulMode = CudaMatMulMode.Custom)
     {
         CudaAccelerator? accelerator = null;
+        CuBlas? cuBlas = null;
         string stage = "CUDA context";
         try
         {
             Context context = SharedContext.Value;
             accelerator = context.CreateCudaAccelerator(deviceIndex);
             _accelerator = accelerator;
+            _matMulMode = matMulMode;
 
             stage = nameof(CudaKernels.AddInPlace);
             _addInPlace = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.BinaryArgs>(CudaKernels.AddInPlace);
@@ -141,9 +149,28 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             _sumSquares = accelerator.LoadStreamKernel<CudaKernels.SumSquaresArgs>(CudaKernels.SumSquares);
             stage = nameof(CudaKernels.AdamW);
             _adamW = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.AdamWArgs>(CudaKernels.AdamW);
+
+            if (matMulMode is not CudaMatMulMode.Custom)
+            {
+                if (matMulMode is CudaMatMulMode.CuBlasTf32 && accelerator.Architecture.Major < 8)
+                    throw new NotSupportedException(
+                        $"TF32 cuBLAS matmuls require CUDA compute capability 8.0 or newer; " +
+                        $"{accelerator.Name} is {accelerator.Architecture}.");
+
+                stage = "cuBLAS initialization";
+                cuBlas = new CuBlas(accelerator)
+                {
+                    Stream = (CudaStream)accelerator.DefaultStream,
+                    MathMode = matMulMode is CudaMatMulMode.CuBlasTf32
+                        ? Tf32TensorOpMath
+                        : CuBlasMathMode.DefaultMath,
+                };
+                _cuBlas = cuBlas;
+            }
         }
         catch (Exception ex)
         {
+            cuBlas?.Dispose();
             accelerator?.Dispose();
             throw new InvalidOperationException($"CUDA backend initialization failed during {stage}.", ex);
         }
@@ -165,6 +192,15 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
 
     public string DeviceName => _accelerator.Name;
     public long DeviceMemoryBytes => _accelerator.MemorySize;
+    public bool SupportsTf32 => _accelerator.Architecture.Major >= 8;
+    public CudaMatMulMode MatMulMode => _matMulMode;
+    public string MatMulDescription => _matMulMode switch
+    {
+        CudaMatMulMode.Custom => "custom FP32",
+        CudaMatMulMode.CuBlasFp32 => "cuBLAS FP32",
+        CudaMatMulMode.CuBlasTf32 => "cuBLAS TF32",
+        _ => throw new InvalidOperationException($"Unknown CUDA matmul mode {_matMulMode}."),
+    };
 
     public long CommittedBytes
     {
@@ -374,10 +410,64 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         int slots, int m, int k, int n, int mode, bool accumulate)
     {
         Chunk ca = Read(a), cb = Read(b), cy = Write(y, accumulate);
+        if (_cuBlas is not null)
+        {
+            CuBlasMatMul(ca, cb, cy, slots, m, k, n, mode, accumulate);
+            return;
+        }
+
         var grid = new Index3D((n + 15) / 16, (m + 15) / 16, slots);
         var group = new Index3D(16, 16, 1);
         _matMul((grid, group), new CudaKernels.MatMulArgs(
             View(ca, a.Length), View(cb, b.Length), View(cy, y.Length), m, k, n, slots, mode, accumulate));
+    }
+
+    /// <summary>
+    /// Maps the project's row-major matrices to cuBLAS's column-major SGEMM by
+    /// computing C^T = op(B)^T * op(A)^T. Batched attention matrices are contiguous,
+    /// so each slot is queued on the same stream without any host staging.
+    /// </summary>
+    private void CuBlasMatMul(Chunk a, Chunk b, Chunk y,
+        int slots, int m, int k, int n, int mode, bool accumulate)
+    {
+        CuBlasOperation opB;
+        CuBlasOperation opA;
+        int ldb;
+        int lda;
+        switch (mode)
+        {
+            case 0: // A[M,K] * B[K,N]
+                opB = CuBlasOperation.NonTranspose; ldb = n;
+                opA = CuBlasOperation.NonTranspose; lda = k;
+                break;
+            case 1: // A[M,K] * B[N,K]^T
+                opB = CuBlasOperation.Transpose; ldb = k;
+                opA = CuBlasOperation.NonTranspose; lda = k;
+                break;
+            case 2: // A[K,M]^T * B[K,N]
+                opB = CuBlasOperation.NonTranspose; ldb = n;
+                opA = CuBlasOperation.Transpose; lda = m;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown matmul transpose mode.");
+        }
+
+        ArrayView<float> aView = a.View;
+        ArrayView<float> bView = b.View;
+        ArrayView<float> yView = y.View;
+        int aStride = m * k;
+        int bStride = k * n;
+        int yStride = m * n;
+        float beta = accumulate ? 1f : 0f;
+
+        for (int slot = 0; slot < slots; slot++)
+        {
+            // Arguments are deliberately reversed: row-major C is column-major C^T.
+            _cuBlas!.Gemm(opB, opA, n, m, k, 1f,
+                bView.SubView(slot * bStride, bStride), ldb,
+                aView.SubView(slot * aStride, aStride), lda,
+                beta, yView.SubView(slot * yStride, yStride), n);
+        }
     }
 
     public void MatMulNN(TensorValue a, TensorValue b, TensorValue y, int M, int K, int N, bool accumulate = false)
@@ -620,6 +710,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             if (_disposed) return;
             _disposed = true;
             _accelerator.Synchronize();
+            _cuBlas?.Dispose(); _cuBlas = null;
             _indices?.Dispose(); _nll?.Dispose(); _scalar?.Dispose();
             foreach ((WeakReference<TensorValue> owner, Entry entry) in _entries)
             {
