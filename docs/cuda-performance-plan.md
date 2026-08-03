@@ -120,6 +120,13 @@ only be changed after their cost is measured separately.
 
 ## Task 1 - Add a repeatable performance harness
 
+**Implementation status:** a built-in `benchmark` command now constructs the fresh
+97.9M-parameter shape with synthetic tokens, performs an unmeasured JIT/allocation
+warmup update, and reports measured wall time, throughput, and loss without touching
+training data or checkpoints. It is sufficient for the physical-batch preflight.
+Hardware telemetry, phase-separated timings, JSON output, and the 100-update
+repeatability gate remain follow-up instrumentation rather than launch blockers.
+
 Create a benchmark mode or script that runs the production model shape without
 changing normal training behavior. It should:
 
@@ -139,6 +146,13 @@ fixed-seed loss trajectory.
 **Commit:** `Add repeatable CUDA training benchmarks`
 
 ## Task 2 - Remove per-microbatch loss readbacks
+
+**Implementation status:** CUDA now atomically accumulates cross-entropy NLL into a
+reusable device scalar across all microbatches and performs one final readback per
+training update or validation evaluation. The valid-target count remains exact on
+the host. CPU and D3D12 expose identical begin/end semantics. Direct CPU and real-CUDA
+tests verify the combined mean; the CUDA test also proves two losses cause one
+readback. Training, validation, and checkpoint-resume tests pass.
 
 Keep cross-entropy loss reduction on the device:
 
@@ -208,6 +222,13 @@ one host readback per optimizer update.
 **Commit:** `Reduce CUDA global gradient norm on device`
 
 ## Task 4 - Tune physical batch size for 16 GB GPUs
+
+**Local preflight result (RTX 2080, 8 GB, 2026-08-03):** after the competing game was
+closed, the fresh tied model with cuBLAS FP32 measured 3,127 tok/s at batch 4 / accum
+16 and 1,276 tok/s at batch 8 / accum 8. Batch 16 / accum 4 entered severe memory
+pressure and its run was terminated. Batch 4 remains the safe 8 GB choice. These
+numbers do not select the Vast configuration: repeat the same sweep on the exact
+cloud GPU before starting its full run, where 16-24 GB may favor a larger batch.
 
 The current batch of 4 was selected for an 8 GB RTX 2080, while the rented 5070 Ti
 uses only about 4.8 GB. Benchmark configurations that preserve exactly 32,768

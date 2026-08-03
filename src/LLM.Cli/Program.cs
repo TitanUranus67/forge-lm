@@ -27,6 +27,7 @@ try
         "prepare" => Cli.Prepare(args[1..]),
         "prepare-fineweb" => Cli.PrepareFineWeb(args[1..]),
         "train" => Cli.Train(args[1..]),
+        "benchmark" => Cli.Benchmark(args[1..]),
         "generate" => Cli.Generate(args[1..]),
         "chat" => Cli.Chat(args[1..]),
         _ => Cli.Unknown(args[0]),
@@ -65,6 +66,8 @@ internal static partial class Cli
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
                         [--backend auto|cpu|gpu|cuda]
                         [--matmul-precision custom|fp32|tf32]
+          llm benchmark [--backend cuda] [--batch 4] [--accum 16] [--steps 3]
+                        [--vocab 16257] [--ctx 512] [--dmodel 768] [--layers 12] [--heads 12]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
                         [--matmul-precision custom|fp32|tf32]
@@ -249,6 +252,89 @@ internal static partial class Cli
         Console.WriteLine($"stats: {bytes.Length:N0} bytes -> {totalTokens:N0} tokens, vocab {tok.VocabSize}, " +
                           $"compression {bytes.Length / (double)totalTokens:F2}x");
         return 0;
+    }
+
+    // ---- benchmark -----------------------------------------------------------
+
+    internal static int Benchmark(string[] args)
+    {
+        var p = new Args(args);
+        if (p.Help)
+        {
+            Console.WriteLine("""
+                llm benchmark [options]
+
+                  Runs one unmeasured warmup optimizer update followed by a short,
+                  synthetic GPT training benchmark. No dataset or checkpoint is read
+                  or written. Defaults model the full fresh-run architecture.
+
+                  --backend cuda|gpu|cpu       backend (default cuda)
+                  --matmul-precision custom|fp32|tf32
+                  --vocab 16257 --ctx 512 --dmodel 768 --layers 12 --heads 12
+                  --batch 4 --accum 16 --steps 3
+                """);
+            return 0;
+        }
+
+        int vocab = p.GetInt("vocab", 16257);
+        int ctx = p.GetInt("ctx", 512);
+        int dmodel = p.GetInt("dmodel", 768);
+        int layers = p.GetInt("layers", 12);
+        int heads = p.GetInt("heads", 12);
+        int batch = p.GetInt("batch", 4);
+        int accumulation = p.GetInt("accum", 16);
+        int steps = p.GetInt("steps", 3);
+        int seed = p.GetInt("seed", 42);
+        string backendName = p.Get("backend", "cuda");
+        CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
+        p.Done();
+
+        if (vocab < 257 || vocab > ushort.MaxValue + 1) throw new ArgumentException("--vocab must be in [257, 65536].");
+        if (batch < 1 || accumulation < 1 || steps < 1)
+            throw new ArgumentException("--batch, --accum, and --steps must be >= 1.");
+        var config = new ModelConfig(vocab, ctx, dmodel, layers, heads);
+        ITensorBackend backend = CreateBackend(backendName, cudaMatMulMode);
+        try
+        {
+            var model = new GptModel(config, backend, new Random(seed));
+            long tokensPerUpdate = checked((long)batch * ctx * accumulation);
+            long dataTokens = checked(tokensPerUpdate * (steps + 2) + 1);
+            if (dataTokens > int.MaxValue)
+                throw new ArgumentException("Benchmark data would exceed the in-memory limit.");
+            var ids = new int[(int)dataTokens];
+            for (int i = 0; i < ids.Length; i++)
+                ids[i] = (int)((uint)(i * 1103515245 + 12345) % (uint)vocab);
+            using var data = new DataLoader(ids);
+
+            TrainOptions Options(int measuredSteps) => new()
+            {
+                Steps = measuredSteps,
+                MaxLr = 1e-4f,
+                MinLr = 1e-4f,
+                WarmupSteps = 0,
+                WeightDecay = 0.1f,
+                GradClip = 1f,
+                ContextLength = ctx,
+                BatchSize = batch,
+                AccumulationSteps = accumulation,
+                Seed = seed,
+                LogEvery = measuredSteps,
+                ValEvery = 0,
+            };
+
+            Console.WriteLine($"benchmark: warmup 1 update; model {model.Params.Count:N0} params; " +
+                              $"microbatch {batch} x {ctx}; accum {accumulation}; {tokensPerUpdate:N0} tok/update");
+            Trainer.Train(model, data, val: null, Options(1));
+            TrainSummary summary = Trainer.Train(model, data, val: null, Options(steps));
+            long measuredTokens = checked(tokensPerUpdate * steps);
+            Console.WriteLine($"benchmark: {measuredTokens:N0} tokens in {summary.Elapsed.TotalSeconds:F2}s = " +
+                              $"{measuredTokens / summary.Elapsed.TotalSeconds:N0} tok/s; loss {summary.FinalTrainLoss:F4}");
+            return 0;
+        }
+        finally
+        {
+            (backend as IDisposable)?.Dispose();
+        }
     }
 
     // ---- train ---------------------------------------------------------------

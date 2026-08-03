@@ -42,6 +42,10 @@ dotnet run --project src/LLM.Cli -- generate --model out/model.bin --tokenizer d
 
 # 4. Or chat with it interactively (base model: it continues your text, it won't answer questions)
 dotnet run --project src/LLM.Cli -- chat --model out/model.bin --tokenizer data/shakes
+
+# Benchmark the full training shape without reading data or writing a checkpoint
+dotnet run -c Release --project src/LLM.Cli -- benchmark --backend cuda \
+    --matmul-precision fp32 --batch 4 --accum 16 --steps 3
 ```
 
 All flags are optional where a default exists; run any command with `--help` for
@@ -101,6 +105,9 @@ fail loudly if unavailable. The selected backend and device are printed at start
   the `--tokens` safety limit is reached.
 - `chat` is an interactive REPL over a checkpoint: each line you type is appended
   to a rolling context the model continues. `/reset` clears context, `/quit` exits.
+- `benchmark` performs one unmeasured warmup update and then times synthetic
+  full-shape training. It is the preflight tool for choosing a physical batch on
+  the exact GPU that will host a run; it never reads data or writes a checkpoint.
 
 ## Architecture
 
