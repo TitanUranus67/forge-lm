@@ -2,8 +2,8 @@
 # Safe to run while training: uses the CPU backend, so it never touches the GPU/VRAM
 # the training run needs. Run from the repo root:  .\sample.ps1
 param(
-    [string]$Model = "out/gpt1.bin",
-    [string]$Tokenizer = "data/fineweb",
+    [string]$Model = "out/forge-98m.bin",
+    [string]$Tokenizer = "data/forge",
     [int]$Tokens = 150,
     [double]$Temperature = 0.8,
     [int]$TopK = 40

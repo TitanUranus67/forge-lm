@@ -1,6 +1,6 @@
-# LLM_Scratch
+# Forge
 
-A mini-GPT built from scratch in C# (.NET 9). Everything (BPE tokenizer,
+Forge is a compact language model built from scratch in C# (.NET 9). Everything (BPE tokenizer,
 transformer, AdamW, SIMD tensor backend, checkpoint format) is implemented in
 C#. [ComputeSharp](https://github.com/Sergio0694/ComputeSharp) powers the
 optional Windows D3D12 backend; [ILGPU](https://github.com/m4rs-mt/ILGPU)
@@ -25,7 +25,14 @@ dotnet run --project src/LLM.Cli -- prepare --out data/shakes --merges 2000
 
 # 1b. Or build a real corpus: download N FineWeb-Edu (sample-10BT) shards,
 #     isolate validation by URL, train tokenizer, and stream-encode (takes hours)
-dotnet run --project src/LLM.Cli -- prepare-fineweb --out data/fineweb --shards 10 --merges 16000
+dotnet run --project src/LLM.Cli -- prepare-fineweb --out data/forge --shards 3 --merges 16000
+
+# Train Forge-98M for the fixed 1.024B-token budget; benchmark the Vast GPU first
+# and override batch/accum/matmul with its winning configuration
+dotnet run -c Release --project src/LLM.Cli -- train --preset forge-98m \
+    --backend cuda --data data/forge --tokens 1024000000 --warmup-tokens 4096000 \
+    --lr 6e-4 --minlr 6e-5 --logevery 16 --valevery 320 --valbatches 50 \
+    --saveevery 320
 
 # 2. Train a small GPT (checkpoint written to out/model.bin)
 dotnet run --project src/LLM.Cli -- train --data data/shakes --steps 5000 --out out/model.bin
@@ -147,7 +154,7 @@ fail loudly if unavailable. The selected backend and device are printed at start
   and device coherent: kernels never update `Tensor.Data` (device is
   authoritative until `EnsureHostCurrent`), and host-side writes (optimizer,
   gradient clipping, checkpoint load) must call `InvalidateDeviceCache`.
-  Measured at GPT-1 scale (dmodel 768, 12 layers, ctx 512, batch 8): see below.
+  Measured at the Forge-98M shape (dmodel 768, 12 layers, ctx 512): see below.
 - **CUDA backend** (`Tensor/Cuda/`) — an ILGPU implementation for NVIDIA GPUs
   on Linux and Windows. It covers the complete training interface: tiled fp32
   matmuls, batched attention, normalization, softmax/cross-entropy, embedding
@@ -155,7 +162,7 @@ fail loudly if unavailable. The selected backend and device are printed at start
   Tensor storage is sub-allocated from reusable 64 MB CUDA arenas and remains
   device-resident; tests enforce numerical agreement with CPU, full-model
   gradients, overfit behavior, aliasing, and a steady-state allocation plateau.
-- **Checkpoints** (`Checkpoint/Checkpoint.cs`) — the `LLMSCRATCH4` custom binary
+- **Checkpoints** (`Checkpoint/Checkpoint.cs`) — the `FORGEMODEL1` custom binary
   format stores the tied-model architecture, cumulative step, schedule/configuration,
   complete sampler position, Adam age and moments, input identities, and a SHA-256
   checksum. Loading validates the exact payload size, architecture, and parameter registry.
@@ -174,10 +181,10 @@ fail loudly if unavailable. The selected backend and device are printed at start
   dispatch). The app and test projects set `RollForward=LatestMajor`, so any
   newer runtime (.NET 9.0.3+ servicing or .NET 10) is used automatically when
   installed. The CPU backend is unaffected on any runtime.
-- Reference throughput on an RTX 2080 8 GB, GPT-1 scale
+- Reference throughput on an RTX 2080 8 GB, Forge-98M scale
   (`--dmodel 768 --layers 12 --heads 12 --ctx 512 --batch 8`, 4096 tokens/step):
   CPU ≈ 100 tok/s, GPU ≈ 950 tok/s (~9×). Device memory usage is ~5.5 GB.
-- A controlled 100-step RTX 2080 comparison at the current 110M shape
+- A controlled 100-step RTX 2080 comparison at the previous untied 110M shape
   (`768/12/12`, ctx 512, batch 4, fp32) reached 1,002 tok/s with CUDA versus
   922 tok/s with D3D12. Loss and validation values matched at every logged gate.
 - Checkpoints are backend-agnostic, so a checkpoint created by the D3D12 or CPU

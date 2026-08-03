@@ -8,15 +8,15 @@ namespace LLM.Core.Checkpoint
     using LLM.Core.Training;
 
     /// <summary>
-    /// Deterministic, checksummed training checkpoints for the tied-embedding model.
+    /// Deterministic, checksummed Forge training checkpoints for the tied-embedding model.
     /// A checkpoint contains model weights, cumulative scheduler position, sampler
     /// state, Adam age and moments, and exact tokenizer/data identities.
     /// </summary>
     public static class Checkpoint
     {
-        private static readonly byte[] Magic = "LLMSCRATCH4"u8.ToArray();
+        private static readonly byte[] Magic = "FORGEMODEL1"u8.ToArray();
         private const int ChecksumBytes = 32;
-        private const string Architecture = "gpt2-tied-v1";
+        private const string Architecture = "forge-gpt2-tied-v1";
 
         private sealed class Header
         {
@@ -25,6 +25,7 @@ namespace LLM.Core.Checkpoint
             public int DModel { get; set; }
             public int NLayers { get; set; }
             public int NHeads { get; set; }
+            public string ModelName { get; set; } = "";
             public string Architecture { get; set; } = "";
             public string[] Names { get; set; } = [];
             public TrainingHeader? Training { get; set; }
@@ -133,6 +134,7 @@ namespace LLM.Core.Checkpoint
             DModel = model.Config.DModel,
             NLayers = model.Config.NLayers,
             NHeads = model.Config.NHeads,
+            ModelName = model.Name,
             Architecture = Architecture,
             Names = model.Params.Names.ToArray(),
         };
@@ -175,7 +177,7 @@ namespace LLM.Core.Checkpoint
             byte[] magic = new byte[Magic.Length];
             fs.ReadExactly(magic);
             if (!magic.SequenceEqual(Magic))
-                throw new InvalidDataException($"'{path}' is not a current LLMSCRATCH4 checkpoint.");
+                throw new InvalidDataException($"'{path}' is not a current FORGEMODEL1 checkpoint.");
 
             long contentLength = fs.Length - ChecksumBytes;
             if (contentLength < fs.Position)
@@ -196,12 +198,14 @@ namespace LLM.Core.Checkpoint
                 ?? throw new InvalidDataException("Checkpoint header failed to parse.");
             if (header.Architecture != Architecture)
                 throw new InvalidDataException($"Unsupported checkpoint architecture '{header.Architecture}'.");
+            if (string.IsNullOrWhiteSpace(header.ModelName))
+                throw new InvalidDataException("Checkpoint is missing its Forge model name.");
             if (header.Training is null)
                 throw new InvalidDataException("Training checkpoint is missing its training-state header.");
 
             var config = new ModelConfig(header.VocabSize, header.ContextLength,
                 header.DModel, header.NLayers, header.NHeads);
-            var model = new GptModel(config, backend, new Random(0));
+            var model = new GptModel(config, backend, new Random(0), header.ModelName);
             string[] actualNames = model.Params.Names.ToArray();
             if (!header.Names.SequenceEqual(actualNames))
                 throw new InvalidDataException("Checkpoint parameter names do not match the model registry.");

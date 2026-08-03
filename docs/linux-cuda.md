@@ -1,8 +1,8 @@
 # Linux NVIDIA cloud deployment
 
-The CUDA backend runs the full training path on Linux through ILGPU. Checkpoints
-are backend-agnostic, so the current Windows/D3D12 checkpoint can be copied to a
-Linux NVIDIA instance and resumed without conversion.
+The CUDA backend runs the full Forge training path on Linux through ILGPU.
+Checkpoints are backend-agnostic and contain the model name, complete optimizer
+state, scheduler position, sampler position, and data identities.
 
 ## 1. Publish for Linux
 
@@ -29,13 +29,12 @@ Copy these items to the server:
 
 ```text
 publish/linux-x64/       application
-data/fineweb/tokenizer.json
-data/fineweb/train.bin
-data/fineweb/val.bin
-out/gpt1.bin             checkpoint
+data/forge/tokenizer.json
+data/forge/train.bin
+data/forge/val.bin
 ```
 
-The FineWeb corpus text and parquet shards are not needed for training once the
+The FineWeb-Edu corpus text and parquet shards are not needed for training once the
 three prepared data files exist. Preserve their bytes exactly: checkpoints
 verify the tokenizer and train/validation identities before resuming.
 
@@ -53,37 +52,46 @@ The process must see an NVIDIA driver (`libcuda.so`). On a container host, start
 the container with NVIDIA GPU access. `CUDA_VISIBLE_DEVICES` can be used to expose
 one selected GPU; the backend opens visible device zero.
 
-Run a quick load check:
+Run the production-shape benchmark before committing to a physical batch:
 
 ```sh
-./publish/linux-x64/LLM.Cli generate \
+./publish/linux-x64/LLM.Cli benchmark \
   --backend cuda \
-  --model out/gpt1.bin \
-  --tokenizer data/fineweb \
-  --tokens 0
+  --batch 4 --accum 16 --steps 3
 ```
 
-Startup should print `backend: cuda` followed by the NVIDIA device name and VRAM.
+Repeat with `--batch 8 --accum 8` and, when VRAM headroom permits,
+`--batch 16 --accum 4`. Also compare the default custom matmul with
+`--matmul-precision fp32`. Keep 32,768 tokens per optimizer update.
 
-## 4. Resume the current training run
+## 4. Start Forge-98M from scratch
 
 ```sh
 ./publish/linux-x64/LLM.Cli train \
   --backend cuda \
-  --data data/fineweb \
+  --preset forge-98m \
+  --data data/forge \
+  --tokens 1024000000 \
+  --warmup-tokens 4096000 \
+  --lr 6e-4 \
+  --minlr 6e-5 \
+  --batch 4 \
+  --accum 16 \
   --logevery 16 \
   --valevery 320 \
   --valbatches 50 \
   --saveevery 320 \
-  --init out/gpt1.bin \
-  --out out/gpt1.bin
+  --out out/forge-98m.bin
 ```
 
-The checkpoint restores the model, cumulative optimizer step, Adam moments,
-learning-rate schedule, and training sampler. The first Linux startup hashes the
-three prepared input files, and the first CUDA backend creation JIT-compiles its
-kernels. Both are one-time startup costs for that process.
+Replace batch, accumulation, and matmul precision with the winning benchmark
+configuration. The first startup hashes the three prepared input files, and the
+first CUDA backend creation JIT-compiles its kernels. Both are one-time costs.
+
+To resume later, run the same command with `--init out/forge-98m.bin`; checkpointed
+training settings become the defaults, so architecture and schedule flags may be
+omitted.
 
 For an interruptible cloud instance, send `Ctrl+C` while the process is attached.
 Training finishes the current optimizer step and saves before exiting. Copy the
-new `gpt1.bin` off-instance before terminating ephemeral storage.
+new `forge-98m.bin` off-instance and verify its SHA-256 before terminating ephemeral storage.

@@ -34,7 +34,7 @@ namespace LLM.Core.Tests
             string path = Path.GetTempFileName();
             try
             {
-                var model = new GptModel(Small, B, new Random(42));
+                var model = new GptModel(Small, B, new Random(42), "Forge-Test");
                 int[] tokens = { 5, 6, 7, 8 };
                 Tensor before = model.ForwardLast(tokens);
 
@@ -42,6 +42,7 @@ namespace LLM.Core.Tests
                 GptModel loaded = Checkpoint.Load(path, B);
 
                 Check.True(loaded.Config == Small, "config round-trips");
+                Check.True(loaded.Name == "Forge-Test", "model name round-trips");
                 foreach (string name in model.Params.Names)
                 {
                     float[] a = model.Params.Weight(name).Data;

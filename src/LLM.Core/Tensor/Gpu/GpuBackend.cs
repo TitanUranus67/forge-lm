@@ -41,7 +41,7 @@ namespace LLM.Core.Tensor.Gpu
 
         // Allocator. ComputeSharp caps the number of LIVE buffer objects at 2048 (UAV
         // descriptor heap; verified empirically: allocation #2049 throws
-        // InvalidOperationException), while a GPT-1-scale training step keeps ~5000
+        // InvalidOperationException), while a Forge-scale training step keeps ~5000
         // activation tensors alive at once. Therefore tensors are chunks (buffer +
         // offset) sub-allocated from shared 64 MB arenas; shaders take explicit
         // offsets. Two more constraints shape the design:

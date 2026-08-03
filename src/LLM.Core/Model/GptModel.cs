@@ -35,8 +35,11 @@ namespace LLM.Core.Model
         private int[]? _batchPositions;
         private int _batchPosT = -1, _batchPosBatch = -1;
 
-        public GptModel(ModelConfig config, ITensorBackend backend, Random rng)
+        public GptModel(ModelConfig config, ITensorBackend backend, Random rng, string name = "Forge")
         {
+            if (string.IsNullOrWhiteSpace(name) || name.Length > 64)
+                throw new ArgumentException("Model name must contain 1-64 non-whitespace characters.", nameof(name));
+            Name = name;
             Config = config;
             _b = backend;
             var p = new Parameters(backend);
@@ -95,6 +98,9 @@ namespace LLM.Core.Model
 
         /// <summary>Named parameter registry (weights + gradients), in registration order.</summary>
         public Parameters Params { get; }
+
+        /// <summary>Human-readable model identity persisted in checkpoints.</summary>
+        public string Name { get; }
 
         /// <summary>The tensor backend this model runs on.</summary>
         public ITensorBackend Backend => _b;

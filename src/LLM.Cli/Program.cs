@@ -11,7 +11,7 @@ using LLM.Core.Tensor.Gpu;
 using LLM.Core.Tokenizer;
 using LLM.Core.Training;
 
-// LLM.Cli — mini-GPT command line: prepare / train / generate.
+// LLM.Cli — Forge command line: prepare / train / generate.
 // (train-tokenizer is folded into `prepare`.)
 
 if (args.Length == 0 || args[0] is "--help" or "-h" or "help")
@@ -52,13 +52,14 @@ internal static partial class Cli
     }
 
     internal static void PrintUsage() => Console.WriteLine("""
-        LLM.Cli — mini-GPT from scratch in C#
+        LLM.Cli — Forge from scratch in C#
 
         Usage:
           llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
           llm prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb] [--shards 10]
                               [--merges 16000] [--toktrainmb 200] [--rebuild true]
-          llm train     --data <dir> [--steps 5000 | --tokens N] [--dmodel 128] [--layers 4] [--heads 4]
+          llm train     --data <dir> [--preset forge-98m] [--steps 5000 | --tokens N | --epochs 1]
+                        [--name Forge-98M] [--dmodel 128] [--layers 4] [--heads 4]
                         [--ctx 128] [--batch 8] [--accum 16] [--lr 6e-4] [--minlr 6e-5]
                         [--warmup 100 | --warmup-tokens N] [--wd 0.1]
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
@@ -296,7 +297,7 @@ internal static partial class Cli
         ITensorBackend backend = CreateBackend(backendName, cudaMatMulMode);
         try
         {
-            var model = new GptModel(config, backend, new Random(seed));
+            var model = new GptModel(config, backend, new Random(seed), "Forge-98M");
             long tokensPerUpdate = checked((long)batch * ctx * accumulation);
             long dataTokens = checked(tokensPerUpdate * (steps + 2) + 1);
             if (dataTokens > int.MaxValue)
@@ -347,10 +348,14 @@ internal static partial class Cli
             Console.WriteLine("""
                 llm train --data <dir> [options]
 
-                  Trains a GPT on the tokenizer.json + train.bin/val.bin produced by
-                  `prepare`, and writes a checkpoint to --out (default out/model.bin).
-                  Each physical pass processes --batch sequences (default 8); --accum
-                  physical passes are averaged into each optimizer update (default 16).
+                  Trains Forge on tokenizer.json + train.bin/val.bin produced by
+                  `prepare`. --preset forge-98m selects 768/12/12/512, a safe
+                  batch 4 / accum 16 starting point, the Forge-98M name, and
+                  out/forge-98m.bin. Explicit flags can override preset defaults.
+                  --epochs derives the token budget from train.bin.
+                  Each physical pass processes --batch sequences (custom default 8,
+                  Forge-98M preset 4); --accum physical passes are averaged into each
+                  optimizer update (default 16).
                   --init resumes a current training checkpoint exactly (model, Adam,
                   global step, LR schedule, sampler, and input identities). Checkpoints
                   are SHA-256 verified and the previous save rotates to .bak.
@@ -363,19 +368,27 @@ internal static partial class Cli
                   math and requires compute capability 8.0 or newer.
                   Ctrl+C stops after the current step and still saves.
                   --accum N averages N physical batches before each Adam/LR step.
-                  --tokens and --warmup-tokens convert token budgets into optimizer
+                  --tokens, --epochs, and --warmup-tokens convert budgets into optimizer
                   update counts using batch * context * accumulation.
                 """);
             return 0;
         }
 
         string dataDir = p.Require("data");
+        string preset = p.Get("preset", "custom");
+        bool forge98M = preset switch
+        {
+            "custom" => false,
+            "forge-98m" => true,
+            _ => throw new ArgumentException("--preset must be forge-98m or omitted."),
+        };
         int? stepsArg = p.GetInt("steps");
         long? tokensArg = p.GetLong("tokens");
-        int dmodel = p.GetInt("dmodel", 128);
-        int layers = p.GetInt("layers", 4);
-        int heads = p.GetInt("heads", 4);
-        int ctx = p.GetInt("ctx", 128);
+        float? epochsArg = p.GetFloat("epochs");
+        int dmodel = p.GetInt("dmodel", forge98M ? 768 : 128);
+        int layers = p.GetInt("layers", forge98M ? 12 : 4);
+        int heads = p.GetInt("heads", forge98M ? 12 : 4);
+        int ctx = p.GetInt("ctx", forge98M ? 512 : 128);
         int? batchArg = p.GetInt("batch");
         int? accumulationArg = p.GetInt("accum");
         float? lrArg = p.GetFloat("lr");
@@ -389,15 +402,20 @@ internal static partial class Cli
         int valevery = p.GetInt("valevery", 250);
         int valbatches = p.GetInt("valbatches", 50);
         int valseed = p.GetInt("valseed", 424242);
-        string outPath = p.Get("out", Path.Combine("out", "model.bin"));
+        string modelName = p.Get("name", forge98M ? "Forge-98M" : "Forge");
+        string outPath = p.Get("out", Path.Combine("out", forge98M ? "forge-98m.bin" : "model.bin"));
         string? init = p.Get("init");
         int saveevery = p.GetInt("saveevery", 0);
         string backendName = p.Get("backend", "auto");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
         p.Done();
 
-        if (stepsArg is not null && tokensArg is not null)
-            throw new ArgumentException("Use either --steps or --tokens, not both.");
+        int budgetFlags = (stepsArg is not null ? 1 : 0) + (tokensArg is not null ? 1 : 0) +
+                          (epochsArg is not null ? 1 : 0);
+        if (budgetFlags > 1)
+            throw new ArgumentException("Use only one of --steps, --tokens, or --epochs.");
+        if (epochsArg is float epochs && (!float.IsFinite(epochs) || epochs <= 0f))
+            throw new ArgumentException("--epochs must be finite and > 0.");
         if (warmupArg is not null && warmupTokensArg is not null)
             throw new ArgumentException("Use either --warmup or --warmup-tokens, not both.");
 
@@ -412,7 +430,7 @@ internal static partial class Cli
                 ?? throw new InvalidDataException("Training checkpoint did not contain resumable state.");
             string resumeDescription =
                 $"training state at global step {trainState.GlobalStep:N0} (Adam step {trainState.Optimizer.StepCount:N0})";
-            Console.WriteLine($"model: loaded {init} ({resumeDescription}; " +
+            Console.WriteLine($"model: {model.Name} loaded from {init} ({resumeDescription}; " +
                               $"vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                               $"dmodel {model.Config.DModel}, layers {model.Config.NLayers}, heads {model.Config.NHeads})");
         }
@@ -420,19 +438,27 @@ internal static partial class Cli
         {
             var tok = BpeTokenizer.Load(Path.Combine(dataDir, "tokenizer.json"));
             var config = new ModelConfig(tok.VocabSize, ctx, dmodel, layers, heads);
-            model = new GptModel(config, backend, new Random(seed));
-            Console.WriteLine($"model: vocab {config.VocabSize}, ctx {ctx}, dmodel {dmodel}, " +
+            model = new GptModel(config, backend, new Random(seed), modelName);
+            Console.WriteLine($"model: {model.Name} — vocab {config.VocabSize}, ctx {ctx}, dmodel {dmodel}, " +
                               $"layers {layers}, heads {heads}, params {model.Params.Count:N0}");
         }
 
         TrainingConfiguration? stored = trainState?.Configuration;
-        int batch = batchArg ?? stored?.BatchSize ?? 8;
+        int batch = batchArg ?? stored?.BatchSize ?? (forge98M ? 4 : 8);
         int accumulation = accumulationArg ?? stored?.AccumulationSteps ?? 16;
         if (batch < 1) throw new ArgumentException("--batch must be >= 1.");
         if (accumulation < 1) throw new ArgumentException("--accum must be >= 1.");
         long tokensPerUpdate = checked((long)batch * model.Config.ContextLength * accumulation);
+        using var trainLoader = new DataLoader(Path.Combine(dataDir, "train.bin"));
+        using var valLoader = new DataLoader(Path.Combine(dataDir, "val.bin"));
+        Console.WriteLine($"data: {trainLoader.Length:N0} train tokens, {valLoader.Length:N0} val tokens");
+        long? epochTokenBudget = epochsArg is float epochCount
+            ? checked((long)Math.Ceiling((trainLoader.Length - 1) * (double)epochCount))
+            : null;
         int steps = tokensArg is long tokenBudget
             ? UpdatesForTokens(tokenBudget, tokensPerUpdate, "--tokens")
+            : epochTokenBudget is long epochTokens
+                ? UpdatesForTokens(epochTokens, tokensPerUpdate, "--epochs")
             : stepsArg ?? stored?.TotalSteps ?? 5000;
         float lr = lrArg ?? stored?.MaxLr ?? 6e-4f;
         float minlr = minlrArg ?? stored?.MinLr ?? 6e-5f;
@@ -442,9 +468,6 @@ internal static partial class Cli
         float wd = wdArg ?? stored?.WeightDecay ?? 0.1f;
         float gradclip = gradclipArg ?? stored?.GradClip ?? 1.0f;
 
-        var trainLoader = new DataLoader(Path.Combine(dataDir, "train.bin"));
-        var valLoader = new DataLoader(Path.Combine(dataDir, "val.bin"));
-        Console.WriteLine($"data: {trainLoader.Length:N0} train tokens, {valLoader.Length:N0} val tokens");
         long physicalBatchTokens = (long)batch * model.Config.ContextLength;
         Console.WriteLine($"training: microbatch {batch} x {model.Config.ContextLength} ctx " +
                           $"({physicalBatchTokens:N0} tokens), accumulation {accumulation} " +
@@ -580,7 +603,7 @@ internal static partial class Cli
         if (loaded.TokenizerIdentity != tokenizerIdentity)
             throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");
         GptModel model = loaded.Model;
-        Console.WriteLine($"model: {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
+        Console.WriteLine($"model: {model.Name} — {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                           $"params {model.Params.Count:N0})");
 
         int[] promptIds = prompt.Length > 0 ? tok.Encode(prompt) : [tok.EosTokenId];
@@ -647,7 +670,7 @@ internal static partial class Cli
         GptModel model = loaded.Model;
         var rng = new Random(seed);
 
-        Console.WriteLine($"model: {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
+        Console.WriteLine($"model: {model.Name} — {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                           $"params {model.Params.Count:N0})");
         Console.WriteLine("chat — type a line and the model continues it. /reset clears context, /quit exits.");
 
