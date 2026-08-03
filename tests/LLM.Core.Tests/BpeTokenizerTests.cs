@@ -60,12 +60,13 @@ public static class BpeTokenizerTests
         // "abababab...": the pair ('a','b') dominates and must be learned first.
         var corpus = Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("ab", 100)));
         var tok = BpeTokenizer.Train(corpus, 1);
-        Check.True(tok.VocabSize == 257, "VocabSize == 256 + numMerges");
+        Check.True(tok.VocabSize == 258, "VocabSize == 256 bytes + one merge + EOS");
+        Check.True(tok.EosTokenId == 257, "EOS follows the learned merge tokens");
         int[] ids = tok.Encode("ab");
         Check.True(ids.Length == 1 && ids[0] == 256, "one merge collapses 'ab' to id 256");
 
         var tok5 = BpeTokenizer.Train(corpus, 5);
-        Check.True(tok5.VocabSize == 261, "VocabSize grows with numMerges");
+        Check.True(tok5.VocabSize == 262, "VocabSize grows with numMerges and includes EOS");
     }
 
     [Test]
@@ -89,6 +90,7 @@ public static class BpeTokenizerTests
             tok.Save(path);
             var loaded = BpeTokenizer.Load(path);
             Check.True(loaded.VocabSize == tok.VocabSize, "VocabSize survives save/load");
+            Check.True(loaded.EosTokenId == tok.EosTokenId, "EOS id survives save/load");
 
             string[] samples = { Corpus, "unseen text with unicode héllo 🌍", "abc123!@#" };
             foreach (string s in samples)
@@ -109,7 +111,8 @@ public static class BpeTokenizerTests
     public static void Untrained_RoundTripsArbitraryBytes()
     {
         var tok = BpeTokenizer.Train(Array.Empty<byte>(), 0);
-        Check.True(tok.VocabSize == 256, "untrained vocab is exactly the 256 bytes");
+        Check.True(tok.VocabSize == 257, "untrained vocab is 256 bytes plus EOS");
+        Check.True(tok.EosTokenId == 256, "untrained tokenizer reserves id 256 for EOS");
 
         // Any byte sequence encodes: with no merges the ids ARE the bytes.
         var rng = new Random(7);
@@ -124,6 +127,41 @@ public static class BpeTokenizerTests
         // And valid UTF-8 text still decodes back to the original string.
         const string s = "héllo 🌍 untrained";
         Check.True(tok.Decode(tok.Encode(s)) == s, "unicode string round-trips untrained");
+    }
+
+    [Test]
+    public static void EncodeDocument_AppendsEosWithoutChangingDecodedText()
+    {
+        var tok = BpeTokenizer.Train(Encoding.UTF8.GetBytes(Corpus), 20);
+        byte[] document = Encoding.UTF8.GetBytes("A complete document.\n");
+        int[] plain = tok.Encode(document);
+        int[] framed = tok.EncodeDocument(document);
+
+        Check.True(framed.Length == plain.Length + 1, "document encoding adds exactly one token");
+        Check.True(framed.AsSpan(0, plain.Length).SequenceEqual(plain), "document text encoding is unchanged");
+        Check.True(framed[^1] == tok.EosTokenId, "document ends in EOS");
+        Check.True(tok.Decode(framed) == Encoding.UTF8.GetString(document), "EOS decodes to no visible text");
+    }
+
+    [Test]
+    public static void Load_LegacyV1TokenizerWithoutEos()
+    {
+        string path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, "{\"Version\":1,\"Merges\":[]}");
+            var legacy = BpeTokenizer.Load(path);
+            Check.True(legacy.VocabSize == 256, "legacy V1 vocabulary remains unchanged");
+            Check.True(legacy.EosTokenId is null, "legacy V1 tokenizer reports no EOS token");
+            Check.True(legacy.Decode(legacy.Encode("legacy text")) == "legacy text", "legacy tokenizer still round-trips");
+
+            legacy.Save(path);
+            Check.True(BpeTokenizer.Load(path).EosTokenId is null, "saving a V1 tokenizer does not invent EOS");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     [Test]
@@ -174,7 +212,8 @@ public static class BpeTokenizerTests
         Check.True(naiveMerges.Count == merges, $"naive trainer learned all {merges} merges");
 
         var fast = BpeTokenizer.Train(corpus, merges);
-        Check.True(fast.VocabSize == 256 + naiveMerges.Count, "fast trainer learned the same number of merges");
+        Check.True(fast.VocabSize == 256 + naiveMerges.Count + 1,
+            "fast trainer learned the same number of merges plus EOS");
 
         // Held-out sample from the same generator (different seed).
         byte[] sample = SeededText(7, 3000);
@@ -199,7 +238,7 @@ public static class BpeTokenizerTests
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var tok = BpeTokenizer.Train(corpus, 300);
         sw.Stop();
-        Check.True(tok.VocabSize > 256, "perf-guard tokenizer learned merges");
+        Check.True(tok.VocabSize > 257, "perf-guard tokenizer learned merges in addition to EOS");
         Check.True(sw.Elapsed < TimeSpan.FromSeconds(60), $"300 merges on 1MB took {sw.Elapsed.TotalSeconds:F1}s (< 60s)");
     }
 

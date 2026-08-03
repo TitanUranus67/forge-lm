@@ -163,7 +163,7 @@ internal static partial class Cli
         string? tokPath = p.Get("tokenizer");
         p.Done();
 
-        const int maxMerges = 65536 - 256; // uint16 token files cap the vocab at 65536
+        const int maxMerges = 65536 - 256 - 1; // reserve one uint16 id for EOS
         if (merges < 0 || merges > maxMerges)
             throw new ArgumentException($"--merges must be in [0, {maxMerges}] (uint16 token ids cap vocab at 65536).");
 
@@ -226,15 +226,34 @@ internal static partial class Cli
         Console.WriteLine("encoding corpus...");
         var swEnc = Stopwatch.StartNew();
         int[] ids = tok.Encode(bytes);
-        Console.WriteLine($"encoded {ids.Length:N0} tokens in {swEnc.Elapsed.TotalSeconds:F1}s");
+        Console.WriteLine($"encoded {ids.Length:N0} text tokens in {swEnc.Elapsed.TotalSeconds:F1}s");
 
         int cut = (int)(ids.Length * 0.9);
-        WriteIds(Path.Combine(outDir, "train.bin"), ids.AsSpan(0, cut));
-        WriteIds(Path.Combine(outDir, "val.bin"), ids.AsSpan(cut));
+        int trainTokens = cut;
+        int valTokens = ids.Length - cut;
+        if (tok.EosTokenId is int eos)
+        {
+            var trainIds = new int[trainTokens + 1];
+            ids.AsSpan(0, trainTokens).CopyTo(trainIds);
+            trainIds[^1] = eos;
+            var valIds = new int[valTokens + 1];
+            ids.AsSpan(cut).CopyTo(valIds);
+            valIds[^1] = eos;
+            WriteIds(Path.Combine(outDir, "train.bin"), trainIds);
+            WriteIds(Path.Combine(outDir, "val.bin"), valIds);
+            trainTokens++;
+            valTokens++;
+        }
+        else
+        {
+            WriteIds(Path.Combine(outDir, "train.bin"), ids.AsSpan(0, cut));
+            WriteIds(Path.Combine(outDir, "val.bin"), ids.AsSpan(cut));
+        }
 
-        Console.WriteLine($"train.bin: {cut:N0} tokens, val.bin: {ids.Length - cut:N0} tokens");
-        Console.WriteLine($"stats: {bytes.Length:N0} bytes -> {ids.Length:N0} tokens, vocab {tok.VocabSize}, " +
-                          $"compression {bytes.Length / (double)ids.Length:F2}x");
+        int totalTokens = trainTokens + valTokens;
+        Console.WriteLine($"train.bin: {trainTokens:N0} tokens, val.bin: {valTokens:N0} tokens");
+        Console.WriteLine($"stats: {bytes.Length:N0} bytes -> {totalTokens:N0} tokens, vocab {tok.VocabSize}, " +
+                          $"compression {bytes.Length / (double)totalTokens:F2}x");
         return 0;
     }
 
@@ -505,7 +524,8 @@ internal static partial class Cli
         var sw = Stopwatch.StartNew();
         int count = 0;
         BpeTokenizer.Utf8StreamDecoder decoder = tok.CreateUtf8StreamDecoder();
-        foreach (int id in Sampler.Generate(model, promptIds, tokens, temperature, topk, rng))
+        foreach (int id in Sampler.Generate(model, promptIds, tokens, temperature, topk, rng,
+                     eosId: tok.EosTokenId))
         {
             Console.Write(decoder.DecodeToken(id));
             count++;
@@ -589,7 +609,8 @@ internal static partial class Cli
 
             Console.Write("llm> ");
             BpeTokenizer.Utf8StreamDecoder decoder = tok.CreateUtf8StreamDecoder();
-            foreach (int id in Sampler.Generate(model, history, tokensPerTurn, temperature, topk, rng))
+            foreach (int id in Sampler.Generate(model, history, tokensPerTurn, temperature, topk, rng,
+                         eosId: tok.EosTokenId))
             {
                 Console.Write(decoder.DecodeToken(id));
                 history.Add(id);

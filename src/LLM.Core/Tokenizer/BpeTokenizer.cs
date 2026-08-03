@@ -1,13 +1,15 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace LLM.Core.Tokenizer;
 
 /// <summary>
 /// Byte-level BPE tokenizer (simplified GPT-2 style). Token ids 0..255 are the
-/// raw bytes; learned merges produce ids 256 and up. Because every byte is a
-/// base token, ANY byte sequence can be encoded and decoded losslessly.
+/// raw bytes; learned merges produce ids 256 and up, followed by an optional
+/// end-of-sequence token. Because every byte is a base token, ANY byte sequence
+/// can be encoded and decoded losslessly.
 /// </summary>
 /// <remarks>
 /// Encoding strategy: rank-greedy. Starting from byte ids, at each step we
@@ -19,7 +21,8 @@ namespace LLM.Core.Tokenizer;
 /// </remarks>
 public sealed class BpeTokenizer
 {
-    private const int CurrentVersion = 1;
+    private const int LegacyVersion = 1;
+    private const int CurrentVersion = 2;
 
     // Merge rules in learned (rank) order; merge k produces id 256 + k.
     private readonly List<(int Left, int Right, int NewId)> _merges = new();
@@ -27,6 +30,7 @@ public sealed class BpeTokenizer
     private readonly Dictionary<long, int> _rank = new();
     // Token id -> the byte sequence it stands for (used by Decode).
     private readonly List<byte[]> _vocab = new();
+    private int? _eosTokenId;
 
     private BpeTokenizer()
     {
@@ -34,8 +38,15 @@ public sealed class BpeTokenizer
             _vocab.Add(new[] { (byte)i });
     }
 
-    /// <summary>Total vocabulary size: 256 base byte tokens plus one id per learned merge.</summary>
-    public int VocabSize => 256 + _merges.Count;
+    /// <summary>Total number of byte, merge, and special tokens.</summary>
+    public int VocabSize => _vocab.Count;
+
+    /// <summary>
+    /// End-of-sequence token for V2 tokenizers, or null for legacy V1 tokenizers.
+    /// Regular text encoding never emits this token; data preparation inserts it
+    /// explicitly at document boundaries.
+    /// </summary>
+    public int? EosTokenId => _eosTokenId;
 
     /// <summary>
     /// Stateful UTF-8 decoder for autoregressive output. BPE token boundaries are
@@ -203,7 +214,18 @@ public sealed class BpeTokenizer
 
             onProgress?.Invoke(m + 1, numMerges);
         }
+        tok.AddEosToken();
         return tok;
+    }
+
+    /// <summary>Appends this tokenizer's EOS token to an already encoded document.</summary>
+    public int[] EncodeDocument(ReadOnlySpan<byte> data)
+    {
+        int eos = _eosTokenId ?? throw new InvalidOperationException("Tokenizer has no EOS token.");
+        int[] text = Encode(data);
+        Array.Resize(ref text, text.Length + 1);
+        text[^1] = eos;
+        return text;
     }
 
     /// <summary>Encodes UTF-8 <paramref name="text"/> into token ids.</summary>
@@ -314,13 +336,14 @@ public sealed class BpeTokenizer
         return _vocab[tokenId];
     }
 
-    /// <summary>Serializes the tokenizer (merges only; the vocab is derived) to JSON.</summary>
+    /// <summary>Serializes the tokenizer; byte and merge vocabulary entries are derived.</summary>
     public void Save(string path)
     {
         var dto = new TokenizerFile
         {
-            Version = CurrentVersion,
+            Version = _eosTokenId.HasValue ? CurrentVersion : LegacyVersion,
             Merges = _merges.Select(m => new[] { m.Left, m.Right, m.NewId }).ToList(),
+            EosTokenId = _eosTokenId,
         };
         var json = JsonSerializer.Serialize(dto, new JsonSerializerOptions { WriteIndented = true });
         File.WriteAllText(path, json);
@@ -331,7 +354,7 @@ public sealed class BpeTokenizer
     {
         var dto = JsonSerializer.Deserialize<TokenizerFile>(File.ReadAllText(path))
             ?? throw new InvalidDataException("tokenizer file is empty or malformed");
-        if (dto.Version != CurrentVersion)
+        if (dto.Version is not (LegacyVersion or CurrentVersion))
             throw new InvalidDataException($"unsupported tokenizer version {dto.Version}");
         dto.Merges ??= new List<int[]>();
 
@@ -354,7 +377,21 @@ public sealed class BpeTokenizer
             tok._merges.Add((left, right, newId));
             tok._rank[PairKey(left, right)] = i;
         }
+        if (dto.Version == CurrentVersion)
+        {
+            if (dto.EosTokenId != tok._vocab.Count)
+                throw new InvalidDataException(
+                    $"EOS token has id {dto.EosTokenId?.ToString() ?? "null"}, expected {tok._vocab.Count}");
+            tok.AddEosToken();
+        }
         return tok;
+    }
+
+    private void AddEosToken()
+    {
+        if (_eosTokenId.HasValue) throw new InvalidOperationException("Tokenizer already has an EOS token.");
+        _eosTokenId = _vocab.Count;
+        _vocab.Add(Array.Empty<byte>());
     }
 
     private static long PairKey(int left, int right) => ((long)left << 32) | (uint)right;
@@ -375,5 +412,7 @@ public sealed class BpeTokenizer
     {
         public int Version { get; set; }
         public List<int[]>? Merges { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public int? EosTokenId { get; set; }
     }
 }

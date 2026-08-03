@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using LLM.Core.Tokenizer;
 using Parquet;
@@ -17,11 +19,12 @@ internal static partial class Cli
     private const string FineWebResolveUrl =
         "https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/";
 
-    private const int EncodeChunkSize = 50 << 20; // 50 MB encode chunks, split at newlines
-    private const int FineWebManifestVersion = 1;
+    private const int EncodeChunkSize = 50 << 20; // progress-report interval while encoding documents
+    private const int FineWebManifestVersion = 2;
 
     private sealed record ShardIdentity(string Path, long Size);
-    private sealed record CorpusManifest(int Version, ShardIdentity[] Shards, long CorpusBytes, long Documents);
+    private sealed record CorpusManifest(int Version, ShardIdentity[] Shards, long CorpusBytes,
+        long DocumentIndexBytes, long Documents);
     private sealed record TokenizerManifest(int Version, string CorpusId, int Merges, int TrainingMegabytes,
         int VocabularySize, string TokenizerSha256);
     private sealed record DataManifest(int Version, string CorpusId, string TokenizerSha256,
@@ -39,7 +42,7 @@ internal static partial class Cli
                   from Hugging Face into <out>/shards (existing files are skipped,
                   so reruns resume), extracts the `text` column into <out>/corpus.txt,
                   trains a byte-level BPE tokenizer on the first --toktrainmb MB only,
-                  then stream-encodes the full corpus in 50 MB chunks and writes the
+                  then stream-encodes each document followed by EOS and writes the
                   usual tokenizer.json + train.bin/val.bin (90/10, LE uint16).
                   Derived artifacts are written transactionally and accompanied by
                   manifests. A stale or unverifiable corpus is never silently reused;
@@ -55,7 +58,7 @@ internal static partial class Cli
         bool rebuild = p.GetBool("rebuild", false);
         p.Done();
 
-        const int maxMerges = 65536 - 256; // uint16 token files cap the vocab at 65536
+        const int maxMerges = 65536 - 256 - 1; // reserve one uint16 id for EOS
         if (merges < 0 || merges > maxMerges)
             throw new ArgumentException($"--merges must be in [0, {maxMerges}] (uint16 token ids cap vocab at 65536).");
         if (shards < 1) throw new ArgumentException("--shards must be >= 1");
@@ -63,6 +66,7 @@ internal static partial class Cli
 
         string shardDir = Path.Combine(outDir, "shards");
         string corpusPath = Path.Combine(outDir, "corpus.txt");
+        string documentIndexPath = Path.Combine(outDir, "corpus.idx");
         string corpusManifestPath = Path.Combine(outDir, ".fineweb-corpus.json");
         string tokenizerManifestPath = Path.Combine(outDir, ".fineweb-tokenizer.json");
         string dataManifestPath = Path.Combine(outDir, ".fineweb-data.json");
@@ -72,7 +76,7 @@ internal static partial class Cli
         {
             foreach (string path in new[]
             {
-                corpusPath, corpusPath + ".tmp", corpusManifestPath,
+                corpusPath, corpusPath + ".tmp", documentIndexPath, documentIndexPath + ".tmp", corpusManifestPath,
                 Path.Combine(outDir, "tokenizer.json"), Path.Combine(outDir, "tokenizer.json.tmp"), tokenizerManifestPath,
                 Path.Combine(outDir, "tokens.tmp"), Path.Combine(outDir, "train.bin"), Path.Combine(outDir, "train.bin.tmp"),
                 Path.Combine(outDir, "val.bin"), Path.Combine(outDir, "val.bin.tmp"), dataManifestPath,
@@ -104,14 +108,16 @@ internal static partial class Cli
 
         ShardIdentity[] expectedShards = wanted.Select(s => new ShardIdentity(s.Path, s.Size)).ToArray();
 
-        // 2. extract the text column -> corpus.txt (streamed, one \n between docs)
+        // 2. extract text plus a byte-length index so real document boundaries survive encoding
         long docs;
         CorpusManifest? corpusManifest = ReadManifest<CorpusManifest>(corpusManifestPath);
-        bool corpusVerified = File.Exists(corpusPath) && corpusManifest is not null &&
+        bool corpusVerified = File.Exists(corpusPath) && File.Exists(documentIndexPath) && corpusManifest is not null &&
             corpusManifest.Version == FineWebManifestVersion &&
             corpusManifest.Shards.SequenceEqual(expectedShards) &&
-            new FileInfo(corpusPath).Length == corpusManifest.CorpusBytes;
-        if (File.Exists(corpusPath) || File.Exists(corpusManifestPath))
+            new FileInfo(corpusPath).Length == corpusManifest.CorpusBytes &&
+            new FileInfo(documentIndexPath).Length == corpusManifest.DocumentIndexBytes &&
+            corpusManifest.DocumentIndexBytes == corpusManifest.Documents * sizeof(long);
+        if (File.Exists(corpusPath) || File.Exists(documentIndexPath) || File.Exists(corpusManifestPath))
         {
             if (!corpusVerified)
                 throw new InvalidDataException(
@@ -123,14 +129,17 @@ internal static partial class Cli
         else
         {
             string corpusTmp = corpusPath + ".tmp";
+            string documentIndexTmp = documentIndexPath + ".tmp";
             if (File.Exists(corpusTmp)) File.Delete(corpusTmp);
+            if (File.Exists(documentIndexTmp)) File.Delete(documentIndexTmp);
             var sw = Stopwatch.StartNew();
             docs = 0;
             foreach (string shard in localShards)
-                docs += ExtractText(shard, corpusTmp).GetAwaiter().GetResult();
+                docs += ExtractText(shard, corpusTmp, documentIndexTmp).GetAwaiter().GetResult();
             File.Move(corpusTmp, corpusPath, overwrite: true);
+            File.Move(documentIndexTmp, documentIndexPath, overwrite: true);
             corpusManifest = new CorpusManifest(FineWebManifestVersion, expectedShards,
-                new FileInfo(corpusPath).Length, docs);
+                new FileInfo(corpusPath).Length, new FileInfo(documentIndexPath).Length, docs);
             WriteManifest(corpusManifestPath, corpusManifest);
             Console.WriteLine($"corpus: {docs:N0} docs, {new FileInfo(corpusPath).Length:N0} bytes " +
                               $"in {sw.Elapsed.TotalSeconds:F1}s");
@@ -199,7 +208,7 @@ internal static partial class Cli
                 if (File.Exists(path)) File.Delete(path);
             Console.WriteLine($"encoding {corpusBytes / 1e9:F2} GB corpus in {EncodeChunkSize >> 20} MB chunks...");
             var sw = Stopwatch.StartNew();
-            tokens = StreamEncode(tok, corpusPath, tmpBin, sw);
+            tokens = StreamEncode(tok, corpusPath, documentIndexPath, docs, tmpBin, sw);
             Console.WriteLine($"encoded {tokens:N0} tokens in {sw.Elapsed.TotalMinutes:F1} min " +
                               $"({tokens / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):N0} tok/s)");
             long cutTokens = (long)(tokens * 0.9);
@@ -299,15 +308,21 @@ internal static partial class Cli
         Console.WriteLine($"fineweb: saved {local} in {sw.Elapsed.TotalMinutes:F1} min");
     }
 
-    /// <summary>Appends the `text` column of one parquet shard to the corpus; returns doc count.</summary>
-    private static async Task<long> ExtractText(string shardPath, string corpusPath)
+    /// <summary>
+    /// Appends one shard's text to the corpus and records each document's UTF-8 byte length.
+    /// The index lets encoding insert EOS at true document boundaries even when documents
+    /// contain embedded newlines.
+    /// </summary>
+    private static async Task<long> ExtractText(string shardPath, string corpusPath, string documentIndexPath)
     {
         Console.WriteLine($"extract: {Path.GetFileName(shardPath)}");
         using var input = File.OpenRead(shardPath);
         await using var reader = await ParquetReader.CreateAsync(input);
         DataField textField = reader.Schema.GetDataFields().First(f => f.Name == "text");
         using var writer = new StreamWriter(corpusPath, append: true,
-            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 1 << 20);
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 1 << 20);
+        using var index = new BinaryWriter(new FileStream(documentIndexPath, FileMode.Append,
+            FileAccess.Write, FileShare.None, 1 << 20));
         long docs = 0;
         for (int rg = 0; rg < reader.RowGroupCount; rg++)
         {
@@ -320,6 +335,7 @@ internal static partial class Cli
                 {
                     writer.Write(text);
                     writer.Write('\n');
+                    index.Write((long)Encoding.UTF8.GetByteCount(text) + 1);
                     docs++;
                 }
             }
@@ -348,47 +364,72 @@ internal static partial class Cli
         return buf.AsSpan(0, fill).ToArray();
     }
 
-    /// <summary>Encodes the corpus in newline-aligned chunks, appending LE uint16 ids; returns token count.</summary>
-    private static long StreamEncode(BpeTokenizer tok, string corpusPath, string tmpBin, Stopwatch sw)
+    /// <summary>Encodes every indexed document followed by EOS as LE uint16 ids.</summary>
+    private static long StreamEncode(BpeTokenizer tok, string corpusPath, string documentIndexPath,
+        long expectedDocuments, string tmpBin, Stopwatch sw)
     {
-        var buf = new byte[EncodeChunkSize];
-        var outBuf = new byte[EncodeChunkSize * 2]; // worst case: one token per byte
-        long tokens = 0, done = 0;
-        using var input = new FileStream(corpusPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-        using var output = new FileStream(tmpBin, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
+        int eos = tok.EosTokenId ?? throw new InvalidDataException("FineWeb tokenizer has no EOS token.");
+        var outBuf = new byte[1 << 20];
+        int outFill = 0;
+        long tokens = 0, documents = 0, nextReport = EncodeChunkSize;
+        using var input = new FileStream(corpusPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            1 << 20, FileOptions.SequentialScan);
+        using var index = new BinaryReader(new FileStream(documentIndexPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read, 1 << 20, FileOptions.SequentialScan));
+        using var output = new FileStream(tmpBin, FileMode.Create, FileAccess.Write, FileShare.None,
+            1 << 20, FileOptions.SequentialScan);
         long total = input.Length;
-        while (true)
+
+        void WriteId(int id)
         {
-            int fill = 0;
-            while (fill < buf.Length)
+            if ((uint)id > ushort.MaxValue)
+                throw new InvalidDataException($"token id {id} exceeds the uint16 data format");
+            if (outFill == outBuf.Length)
             {
-                int r = input.Read(buf, fill, buf.Length - fill);
-                if (r == 0) break;
-                fill += r;
+                output.Write(outBuf);
+                outFill = 0;
             }
-            if (fill == 0) break;
-
-            // more data follows: back off to the last newline so docs stay whole
-            int n = fill;
-            if (input.Position < total)
-            {
-                int nl = Array.LastIndexOf(buf, (byte)'\n', fill - 1);
-                if (nl > 0) n = nl + 1;
-            }
-
-            int[] ids = tok.Encode(buf.AsSpan(0, n));
-            for (int i = 0; i < ids.Length; i++)
-            {
-                outBuf[2 * i] = (byte)ids[i];
-                outBuf[2 * i + 1] = (byte)(ids[i] >> 8);
-            }
-            output.Write(outBuf, 0, ids.Length * 2);
-            tokens += ids.Length;
-            done += n;
-            if (n < fill) input.Seek(n - fill, SeekOrigin.Current);
-            Console.WriteLine($"encode: {done / 1e6:F0}/{total / 1e6:F0} MB " +
-                              $"({tokens:N0} tokens, {done / 1e6 / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):F1} MB/s)");
+            outBuf[outFill++] = (byte)id;
+            outBuf[outFill++] = (byte)(id >> 8);
         }
+
+        while (index.BaseStream.Position < index.BaseStream.Length)
+        {
+            long documentBytes = index.ReadInt64();
+            if (documentBytes <= 0 || documentBytes > int.MaxValue)
+                throw new InvalidDataException($"invalid FineWeb document length {documentBytes:N0}");
+
+            byte[] rented = ArrayPool<byte>.Shared.Rent((int)documentBytes);
+            try
+            {
+                input.ReadExactly(rented.AsSpan(0, (int)documentBytes));
+                int[] ids = tok.Encode(rented.AsSpan(0, (int)documentBytes));
+                foreach (int id in ids) WriteId(id);
+                WriteId(eos);
+                tokens += ids.Length + 1L;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+            documents++;
+
+            if (input.Position >= nextReport)
+            {
+                Console.WriteLine($"encode: {input.Position / 1e6:F0}/{total / 1e6:F0} MB " +
+                                  $"({tokens:N0} tokens, {documents:N0} docs, " +
+                                  $"{input.Position / 1e6 / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):F1} MB/s)");
+                nextReport += EncodeChunkSize;
+            }
+        }
+
+        if (outFill > 0) output.Write(outBuf, 0, outFill);
+        if (input.Position != input.Length)
+            throw new InvalidDataException(
+                $"FineWeb document index covers {input.Position:N0} of {input.Length:N0} corpus bytes");
+        if (documents != expectedDocuments)
+            throw new InvalidDataException(
+                $"FineWeb document index contains {documents:N0} entries, expected {expectedDocuments:N0}");
         return tokens;
     }
 

@@ -59,11 +59,12 @@ fail loudly if unavailable. The selected backend and device are printed at start
   config): it lists the parquet shards via the Hugging Face API, downloads the
   first `--shards N` (default 10, ~2.1 GB each) into `<out>/shards/` (existing
   complete shards are skipped, so interrupted runs resume), extracts the `text`
-  column into `<out>/corpus.txt` via
+  column into `<out>/corpus.txt` with a document-length index at
+  `<out>/corpus.idx` via
   [Parquet.Net](https://github.com/aloneguid/parquet-dotnet) (CLI-only
   dependency), trains the tokenizer on the first `--toktrainmb` MB only
-  (default 200), then stream-encodes the full corpus in 50 MB newline-aligned
-  chunks — a multi-GB corpus never has to fit in memory. Encoding is the slow
+  (default 200), then stream-encodes every document followed by EOS — a multi-GB
+  corpus never has to fit in memory. Encoding is the slow
   phase (tens of minutes to hours depending on merges/corpus size); progress in
   MB is printed per chunk. Corpus, tokenizer, and bin artifacts are published
   transactionally with provenance manifests; stale or incomplete artifacts are
@@ -94,16 +95,18 @@ fail loudly if unavailable. The selected backend and device are printed at start
   upgrades it. Startup hashes the input files before an optimizer update.
 - `generate` loads a checkpoint and samples autoregressively with temperature
   and top-k filtering. An incremental UTF-8 decoder preserves characters whose
-  bytes span token boundaries.
+  bytes span token boundaries. Generation stops when EOS is sampled or when
+  the `--tokens` safety limit is reached.
 - `chat` is an interactive REPL over a checkpoint: each line you type is appended
   to a rolling context the model continues. `/reset` clears context, `/quit` exits.
 
 ## Architecture
 
 - **BPE tokenizer** (`Tokenizer/BpeTokenizer.cs`) — byte-level, GPT-2 style.
-  Ids 0–255 are raw bytes; learned merges produce ids 256+. Encoding is
-  rank-greedy; arbitrary bytes remain representable and valid UTF-8 text
-  round-trips losslessly.
+  Ids 0–255 are raw bytes, learned merges produce ids 256+, and V2 tokenizers
+  append a dedicated EOS id. Encoding is rank-greedy; arbitrary bytes remain
+  representable and valid UTF-8 text round-trips losslessly. Legacy V1
+  tokenizers without EOS remain loadable.
 - **GPT model** (`Model/`) — GPT-2 architecture: learned token + positional
   embeddings, pre-LN transformer blocks (multi-head causal self-attention +
   GELU MLP), final LayerNorm, untied output head. Training is batched: B
