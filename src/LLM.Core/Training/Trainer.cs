@@ -133,7 +133,7 @@ namespace LLM.Core.Training
                 long p0 = prof ? Stopwatch.GetTimestamp() : 0;
                 model.Params.ZeroGrads();
                 long p1 = prof ? Stopwatch.GetTimestamp() : 0;
-                double trainLossSum = 0;
+                model.Backend.BeginLossAccumulation();
                 for (int microStep = 0; microStep < accumulation; microStep++)
                 {
                     for (int b = 0; b < batch; b++)
@@ -142,9 +142,9 @@ namespace LLM.Core.Training
                         Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
                         Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
                     }
-                    trainLossSum += model.ForwardBackward(inputs, targets, batch);
+                    model.ForwardBackward(inputs, targets, batch);
                 }
-                lastTrain = (float)(trainLossSum / accumulation);
+                lastTrain = model.Backend.EndLossAccumulation();
                 if (accumulation > 1)
                     ScaleGradients(model.Params, model.Backend, 1f / accumulation);
                 long p2 = prof ? Stopwatch.GetTimestamp() : 0;
@@ -196,7 +196,7 @@ namespace LLM.Core.Training
             var sampler = new TrainingSampler(valSeed);
             int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
-            double lossSum = 0;
+            model.Backend.BeginLossAccumulation();
             for (int evalBatch = 0; evalBatch < valBatches; evalBatch++)
             {
                 for (int b = 0; b < batch; b++)
@@ -205,9 +205,9 @@ namespace LLM.Core.Training
                     Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
                     Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
                 }
-                lossSum += model.EvaluateLoss(inputs, targets, batch);
+                model.EvaluateLoss(inputs, targets, batch);
             }
-            return (float)(lossSum / valBatches);
+            return model.Backend.EndLossAccumulation();
         }
 
         /// <summary>Scales all gradients so the global L2 norm does not exceed maxNorm.</summary>

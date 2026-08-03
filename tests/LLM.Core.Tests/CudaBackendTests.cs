@@ -59,6 +59,34 @@ public static class CudaBackendTests
     }
 
     [Test]
+    public static void LossAccumulator_MatchesCpuWithOneReadback()
+    {
+        if (Skip()) return;
+        var cpu = new CpuBackend();
+        float[] firstValues = [2f, 0f, -1f, 0f, 1f, 2f];
+        float[] secondValues = [-1f, 3f, 0f];
+        int[] firstTargets = [0, 2];
+        int[] secondTargets = [1];
+
+        float first = cpu.CrossEntropyForward(new Tensor((float[])firstValues.Clone(), 2, 3), firstTargets,
+            new Tensor(2, 3), 2, 3, -1);
+        float second = cpu.CrossEntropyForward(new Tensor((float[])secondValues.Clone(), 1, 3), secondTargets,
+            new Tensor(1, 3), 1, 3, -1);
+        long readbacksBefore = Cuda!.ReductionReadbackCount;
+
+        Cuda.BeginLossAccumulation();
+        Cuda.CrossEntropyForward(new Tensor((float[])firstValues.Clone(), 2, 3), firstTargets,
+            new Tensor(2, 3), 2, 3, -1);
+        Cuda.CrossEntropyForward(new Tensor((float[])secondValues.Clone(), 1, 3), secondTargets,
+            new Tensor(1, 3), 1, 3, -1);
+        float actual = Cuda.EndLossAccumulation();
+
+        Check.Near(actual, (first * 2f + second) / 3f, 1e-5f, "CUDA accumulated loss matches CPU");
+        Check.True(Cuda.ReductionReadbackCount - readbacksBefore == 1,
+            "multiple CUDA losses require one final host readback");
+    }
+
+    [Test]
     public static void CuBlasFp32_MatmulsAndModelMatchCpu()
     {
         if (Skip()) return;

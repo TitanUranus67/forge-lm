@@ -45,6 +45,9 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     private int _indicesLength;
     private MemoryBuffer1D<float, Stride1D.Dense>? _nll;
     private int _nllLength;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _lossScalar;
+    private bool _accumulatingLoss;
+    private long _accumulatedTargets;
     private MemoryBuffer1D<float, Stride1D.Dense>? _scalar;
     private MemoryBuffer1D<float, Stride1D.Dense>? _sumSquaresPartials;
     private int _sumSquaresPartialsLength;
@@ -724,19 +727,51 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
 
     public float CrossEntropyForward(TensorValue logits, int[] targets, TensorValue probs, int T, int V, int ignoreIndex)
     {
+        int count = targets.Count(target => target != ignoreIndex);
         lock (_gate)
         {
             Chunk cl = Read(logits), cp = Write(probs);
             ArrayView<int> targetView = CopyIndices(targets);
-            ArrayView<float> nll = NllView(T);
+            ArrayView<float> nll = _accumulatingLoss ? _lossScalar!.View : NllView(T);
             _crossEntropyForward(T, new CudaKernels.CrossEntropyForwardArgs(
-                View(cl, logits.Length), targetView, View(cp, probs.Length), nll, T, V, ignoreIndex));
+                View(cl, logits.Length), targetView, View(cp, probs.Length), nll, T, V, ignoreIndex,
+                _accumulatingLoss ? 1 : 0));
+            if (_accumulatingLoss)
+            {
+                _accumulatedTargets += count;
+                return 0f;
+            }
             float[] perRow = new float[T];
             nll.CopyToCPU(perRow);
-            double total = 0; int count = 0;
+            double total = 0;
             for (int t = 0; t < T; t++)
-                if (targets[t] != ignoreIndex) { total += perRow[t]; count++; }
+                if (targets[t] != ignoreIndex) total += perRow[t];
             return count == 0 ? 0f : (float)(total / count);
+        }
+    }
+
+    public void BeginLossAccumulation()
+    {
+        lock (_gate)
+        {
+            if (_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is already active.");
+            _lossScalar ??= _accelerator.Allocate1D<float>(1);
+            _scalarHost[0] = 0f;
+            _lossScalar.CopyFromCPU(_scalarHost);
+            _accumulatedTargets = 0;
+            _accumulatingLoss = true;
+        }
+    }
+
+    public float EndLossAccumulation()
+    {
+        lock (_gate)
+        {
+            if (!_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is not active.");
+            _lossScalar!.CopyToCPU(_scalarHost);
+            _accumulatingLoss = false;
+            _reductionReadbacks++;
+            return _accumulatedTargets == 0 ? 0f : _scalarHost[0] / _accumulatedTargets;
         }
     }
 
@@ -767,7 +802,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             _disposed = true;
             _accelerator.Synchronize();
             _cuBlas?.Dispose(); _cuBlas = null;
-            _indices?.Dispose(); _nll?.Dispose(); _scalar?.Dispose(); _sumSquaresPartials?.Dispose();
+            _indices?.Dispose(); _nll?.Dispose(); _lossScalar?.Dispose(); _scalar?.Dispose(); _sumSquaresPartials?.Dispose();
             foreach ((WeakReference<TensorValue> owner, Entry entry) in _entries)
             {
                 if (owner.TryGetTarget(out TensorValue? tensor) && ReferenceEquals(tensor.DeviceResource, entry))

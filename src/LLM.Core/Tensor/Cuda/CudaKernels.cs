@@ -151,10 +151,10 @@ public static class CudaKernels
     {
         public readonly ArrayView<float> Logits, Probs, Nll;
         public readonly ArrayView<int> Targets;
-        public readonly int T, V, IgnoreIndex;
+        public readonly int T, V, IgnoreIndex, AccumulateLoss;
         public CrossEntropyForwardArgs(ArrayView<float> logits, ArrayView<int> targets,
-            ArrayView<float> probs, ArrayView<float> nll, int t, int v, int ignoreIndex)
-        { Logits = logits; Targets = targets; Probs = probs; Nll = nll; T = t; V = v; IgnoreIndex = ignoreIndex; }
+            ArrayView<float> probs, ArrayView<float> nll, int t, int v, int ignoreIndex, int accumulateLoss)
+        { Logits = logits; Targets = targets; Probs = probs; Nll = nll; T = t; V = v; IgnoreIndex = ignoreIndex; AccumulateLoss = accumulateLoss; }
     }
 
     public readonly struct CrossEntropyBackwardArgs
@@ -421,7 +421,9 @@ public static class CudaKernels
         { float e = MathF.Exp(a.Logits[o + c] - max); a.Probs[o + c] = e; sum += e; }
         float inv = 1f / sum;
         for (int c = 0; c < a.V; c++) a.Probs[o + c] *= inv;
-        a.Nll[t] = target == a.IgnoreIndex ? 0f : MathF.Log(sum) + max - targetLogit;
+        float nll = target == a.IgnoreIndex ? 0f : MathF.Log(sum) + max - targetLogit;
+        if (a.AccumulateLoss != 0) Atomic.Add(ref a.Nll[0], nll);
+        else a.Nll[t] = nll;
     }
 
     public static void CrossEntropyBackward(Index1D index, CrossEntropyBackwardArgs a)

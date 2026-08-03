@@ -35,6 +35,9 @@ namespace LLM.Core.Tensor.Gpu
 
         private readonly GraphicsDevice _device;
         private readonly object _gate = new();
+        private bool _accumulatingLoss;
+        private double _accumulatedLoss;
+        private long _accumulatedTargets;
 
         // Allocator. ComputeSharp caps the number of LIVE buffer objects at 2048 (UAV
         // descriptor heap; verified empirically: allocation #2049 throws
@@ -852,7 +855,36 @@ namespace LLM.Core.Tensor.Gpu
                 int count = 0;
                 for (int t = 0; t < T; t++)
                     if (targets[t] != ignoreIndex) { total += perRow[t]; count++; }
-                return count > 0 ? (float)(total / count) : 0f;
+                float loss = count > 0 ? (float)(total / count) : 0f;
+                if (_accumulatingLoss)
+                {
+                    _accumulatedLoss += loss * count;
+                    _accumulatedTargets += count;
+                }
+                return loss;
+            }
+        }
+
+        /// <inheritdoc/>
+        public void BeginLossAccumulation()
+        {
+            lock (_gate)
+            {
+                if (_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is already active.");
+                _accumulatingLoss = true;
+                _accumulatedLoss = 0;
+                _accumulatedTargets = 0;
+            }
+        }
+
+        /// <inheritdoc/>
+        public float EndLossAccumulation()
+        {
+            lock (_gate)
+            {
+                if (!_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is not active.");
+                _accumulatingLoss = false;
+                return _accumulatedTargets == 0 ? 0f : (float)(_accumulatedLoss / _accumulatedTargets);
             }
         }
 

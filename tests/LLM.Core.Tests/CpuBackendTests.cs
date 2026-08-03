@@ -333,7 +333,7 @@ namespace LLM.Core.Tests
         }
 
         [Test]
-        public static void CrossEntropy_AliasedInPlaceMatchesSeparate()
+    public static void CrossEntropy_AliasedInPlaceMatchesSeparate()
         {
             // probs/dLogits aliasing the logits buffer (in-place CE) must give identical
             // loss and gradients to the separate-buffer path — GptModel relies on this.
@@ -507,6 +507,27 @@ namespace LLM.Core.Tests
             // ignored row gets exactly zero gradient
             for (int v = 0; v < V; v++)
                 Check.Near(dLogits[1 * V + v], 0f, 0f, "ignored row zero gradient");
+        }
+
+        [Test]
+        public static void CrossEntropy_LossAccumulationReturnsCombinedMean()
+        {
+            var firstLogits = new Tensor(2, 3);
+            new float[] { 2f, 0f, -1f, 0f, 1f, 2f }.CopyTo(firstLogits.Data, 0);
+            var secondLogits = new Tensor(1, 3);
+            new float[] { -1f, 3f, 0f }.CopyTo(secondLogits.Data, 0);
+            int[] firstTargets = [0, 2];
+            int[] secondTargets = [1];
+
+            float first = B.CrossEntropyForward(firstLogits, firstTargets, new Tensor(2, 3), 2, 3, -1);
+            float second = B.CrossEntropyForward(secondLogits, secondTargets, new Tensor(1, 3), 1, 3, -1);
+            B.BeginLossAccumulation();
+            B.CrossEntropyForward(firstLogits, firstTargets, new Tensor(2, 3), 2, 3, -1);
+            B.CrossEntropyForward(secondLogits, secondTargets, new Tensor(1, 3), 1, 3, -1);
+            float accumulated = B.EndLossAccumulation();
+
+            Check.Near(accumulated, (first * 2f + second) / 3f, 1e-6f,
+                "loss accumulation returns the target-weighted combined mean");
         }
     }
 }

@@ -115,6 +115,13 @@ public interface ITensorBackend
     /// logit before writing), enabling in-place softmax for large vocabularies.
     /// </summary>
     float CrossEntropyForward(Tensor logits, int[] targets, Tensor probs, int T, int V, int ignoreIndex);
+    /// <summary>
+    /// Starts accumulating subsequent cross-entropy losses. Device backends can keep
+    /// the sum resident and defer synchronization until <see cref="EndLossAccumulation"/>.
+    /// </summary>
+    void BeginLossAccumulation();
+    /// <summary>Returns the mean over every non-ignored target since the matching begin.</summary>
+    float EndLossAccumulation();
     /// <summary>dLogits = (probs - onehot(target)) / count. probs from CrossEntropyForward.
     /// dLogits may alias probs (elementwise kernel).</summary>
     void CrossEntropyBackward(Tensor probs, int[] targets, Tensor dLogits, int T, int V, int ignoreIndex);

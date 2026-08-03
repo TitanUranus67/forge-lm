@@ -27,6 +27,9 @@ public class CpuBackend : ITensorBackend
 
     /// <summary>Matmuls with M*K*N at or below this run sequentially (no pooling, no Parallel.For).</summary>
     private const long SmallMatMulWork = 8_000_000;
+    private bool _accumulatingLoss;
+    private double _accumulatedLoss;
+    private long _accumulatedTargets;
 
     // ---- Matmul ------------------------------------------------------------
 
@@ -553,7 +556,31 @@ public class CpuBackend : ITensorBackend
 
     /// <inheritdoc/>
     public float CrossEntropyForward(Tensor logits, int[] targets, Tensor probs, int T, int V, int ignoreIndex)
-        => CrossEntropyForward(logits.AsReadOnlySpan(), targets, probs.AsSpan(), T, V, ignoreIndex);
+    {
+        float loss = CrossEntropyForward(logits.AsReadOnlySpan(), targets, probs.AsSpan(), T, V, ignoreIndex);
+        if (_accumulatingLoss)
+        {
+            int count = targets.Count(target => target != ignoreIndex);
+            _accumulatedLoss += loss * count;
+            _accumulatedTargets += count;
+        }
+        return loss;
+    }
+
+    public void BeginLossAccumulation()
+    {
+        if (_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is already active.");
+        _accumulatingLoss = true;
+        _accumulatedLoss = 0;
+        _accumulatedTargets = 0;
+    }
+
+    public float EndLossAccumulation()
+    {
+        if (!_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is not active.");
+        _accumulatingLoss = false;
+        return _accumulatedTargets == 0 ? 0f : (float)(_accumulatedLoss / _accumulatedTargets);
+    }
 
     /// <inheritdoc/>
     public void CrossEntropyBackward(Tensor probs, int[] targets, Tensor dLogits, int T, int V, int ignoreIndex)
