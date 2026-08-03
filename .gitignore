@@ -1,5 +1,8 @@
 bin/
 obj/
-data/
+data/*
+!data/forge/
+data/forge/*
+!data/forge/SOURCE.md
 out/
 .secrets/
