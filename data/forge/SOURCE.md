@@ -15,7 +15,8 @@ Preparation command:
 dotnet run -c Release --no-build --project src/LLM.Cli -- prepare-fineweb `
     --out data/forge `
     --shards 3 `
-    --merges 16000
+    --merges 16000 `
+    --encode-workers 8
 ```
 
 Preparation details:

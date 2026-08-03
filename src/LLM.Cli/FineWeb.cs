@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Security.Cryptography;
@@ -42,7 +41,8 @@ internal static partial class Cli
         {
             Console.WriteLine("""
                 llm prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb]
-                    [--shards 10] [--merges 16000] [--toktrainmb 200] [--rebuild true]
+                    [--shards 10] [--merges 16000] [--toktrainmb 200]
+                    [--encode-workers <up-to-8>] [--rebuild true]
 
                   Downloads the first --shards parquet shards of FineWeb-Edu sample-10BT
                   by default (`--dataset fineweb` selects unfiltered FineWeb)
@@ -52,6 +52,8 @@ internal static partial class Cli
                   trains byte-level BPE on a representative sample of training documents
                   without cross-document merges, then encodes each document followed by
                   EOS into tokenizer.json + train.bin/val.bin (about 90/10, LE uint16).
+                  Document encoding uses --encode-workers concurrent workers while
+                  preserving deterministic document order and byte-identical outputs.
                   Derived artifacts are written transactionally and accompanied by
                   manifests. A stale or unverifiable corpus is never silently reused;
                   use --rebuild true to regenerate it while keeping downloaded shards.
@@ -64,6 +66,7 @@ internal static partial class Cli
         int shards = p.GetInt("shards", 10);
         int merges = p.GetInt("merges", 16000);
         int tokTrainMb = p.GetInt("toktrainmb", 200);
+        int encodeWorkers = p.GetInt("encode-workers", Math.Min(8, Environment.ProcessorCount));
         bool rebuild = p.GetBool("rebuild", false);
         p.Done();
 
@@ -79,6 +82,7 @@ internal static partial class Cli
             throw new ArgumentException($"--merges must be in [0, {maxMerges}] (uint16 token ids cap vocab at 65536).");
         if (shards < 1) throw new ArgumentException("--shards must be >= 1");
         if (tokTrainMb < 1) throw new ArgumentException("--toktrainmb must be >= 1");
+        if (encodeWorkers < 1) throw new ArgumentException("--encode-workers must be >= 1");
 
         string shardDir = Path.Combine(outDir, "shards", source.Name);
         string corpusPath = Path.Combine(outDir, "corpus.txt");
@@ -224,13 +228,17 @@ internal static partial class Cli
         {
             foreach (string path in new[] { trainTmp, valTmp })
                 if (File.Exists(path)) File.Delete(path);
-            Console.WriteLine($"encoding {corpusBytes / 1e9:F2} GB corpus in {EncodeChunkSize >> 20} MB chunks...");
-            var sw = Stopwatch.StartNew();
-            (long trainTokens, long valTokens) = StreamEncode(tok, corpusPath, documentIndexPath,
-                docs, trainTmp, valTmp, sw);
+            Console.WriteLine($"encoding {corpusBytes / 1e9:F2} GB corpus with {encodeWorkers} workers...");
+            IndexedDocumentEncoder.Summary encoded = IndexedDocumentEncoder.Encode(tok, corpusPath,
+                documentIndexPath, docs, trainTmp, valTmp, encodeWorkers, EncodeChunkSize, progress =>
+                Console.WriteLine($"encode: {progress.BytesRead / 1e6:F0}/{progress.TotalBytes / 1e6:F0} MB " +
+                                  $"({progress.TokensWritten:N0} tokens, {progress.DocumentsWritten:N0} docs, " +
+                                  $"{progress.BytesRead / 1e6 / Math.Max(progress.Elapsed.TotalSeconds, 1e-9):F1} MB/s)"));
+            long trainTokens = encoded.TrainTokens;
+            long valTokens = encoded.ValidationTokens;
             tokens = trainTokens + valTokens;
-            Console.WriteLine($"encoded {tokens:N0} tokens in {sw.Elapsed.TotalMinutes:F1} min " +
-                              $"({tokens / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):N0} tok/s)");
+            Console.WriteLine($"encoded {tokens:N0} tokens in {encoded.Elapsed.TotalMinutes:F1} min " +
+                              $"({tokens / Math.Max(encoded.Elapsed.TotalSeconds, 1e-9):N0} tok/s)");
             File.Move(trainTmp, trainPath, overwrite: true);
             File.Move(valTmp, valPath, overwrite: true);
             dataManifest = new DataManifest(FineWebManifestVersion, corpusId, tokenizerSha, tokens,
@@ -410,82 +418,4 @@ internal static partial class Cli
         return documents;
     }
 
-    /// <summary>Encodes every indexed document followed by EOS into its document-level split.</summary>
-    private static (long TrainTokens, long ValTokens) StreamEncode(BpeTokenizer tok, string corpusPath,
-        string documentIndexPath, long expectedDocuments, string trainPath, string valPath, Stopwatch sw)
-    {
-        int eos = tok.EosTokenId;
-        var trainBuffer = new byte[1 << 20];
-        var valBuffer = new byte[1 << 20];
-        int trainFill = 0, valFill = 0;
-        long trainTokens = 0, valTokens = 0, documents = 0, nextReport = EncodeChunkSize;
-        using var input = new FileStream(corpusPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-            1 << 20, FileOptions.SequentialScan);
-        using var index = new BinaryReader(new FileStream(documentIndexPath, FileMode.Open, FileAccess.Read,
-            FileShare.Read, 1 << 20, FileOptions.SequentialScan));
-        using var trainOutput = new FileStream(trainPath, FileMode.Create, FileAccess.Write, FileShare.None,
-            1 << 20, FileOptions.SequentialScan);
-        using var valOutput = new FileStream(valPath, FileMode.Create, FileAccess.Write, FileShare.None,
-            1 << 20, FileOptions.SequentialScan);
-        long total = input.Length;
-
-        void WriteId(int id, bool validation)
-        {
-            if ((uint)id > ushort.MaxValue)
-                throw new InvalidDataException($"token id {id} exceeds the uint16 data format");
-            byte[] buffer = validation ? valBuffer : trainBuffer;
-            ref int fill = ref (validation ? ref valFill : ref trainFill);
-            FileStream output = validation ? valOutput : trainOutput;
-            if (fill == buffer.Length)
-            {
-                output.Write(buffer);
-                fill = 0;
-            }
-            buffer[fill++] = (byte)id;
-            buffer[fill++] = (byte)(id >> 8);
-        }
-
-        while (index.BaseStream.Position < index.BaseStream.Length)
-        {
-            long documentBytes = index.ReadInt64();
-            bool validation = index.ReadBoolean();
-            _ = index.ReadUInt64(); // tokenizer-sampling key
-            if (documentBytes <= 0 || documentBytes > int.MaxValue)
-                throw new InvalidDataException($"invalid FineWeb document length {documentBytes:N0}");
-
-            byte[] rented = ArrayPool<byte>.Shared.Rent((int)documentBytes);
-            try
-            {
-                input.ReadExactly(rented.AsSpan(0, (int)documentBytes));
-                int[] ids = tok.Encode(rented.AsSpan(0, (int)documentBytes));
-                foreach (int id in ids) WriteId(id, validation);
-                WriteId(eos, validation);
-                if (validation) valTokens += ids.Length + 1L;
-                else trainTokens += ids.Length + 1L;
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
-            documents++;
-
-            if (input.Position >= nextReport)
-            {
-                Console.WriteLine($"encode: {input.Position / 1e6:F0}/{total / 1e6:F0} MB " +
-                                  $"({trainTokens + valTokens:N0} tokens, {documents:N0} docs, " +
-                                  $"{input.Position / 1e6 / Math.Max(sw.Elapsed.TotalSeconds, 1e-9):F1} MB/s)");
-                nextReport += EncodeChunkSize;
-            }
-        }
-
-        if (trainFill > 0) trainOutput.Write(trainBuffer, 0, trainFill);
-        if (valFill > 0) valOutput.Write(valBuffer, 0, valFill);
-        if (input.Position != input.Length)
-            throw new InvalidDataException(
-                $"FineWeb document index covers {input.Position:N0} of {input.Length:N0} corpus bytes");
-        if (documents != expectedDocuments)
-            throw new InvalidDataException(
-                $"FineWeb document index contains {documents:N0} entries, expected {expectedDocuments:N0}");
-        return (trainTokens, valTokens);
-    }
 }
