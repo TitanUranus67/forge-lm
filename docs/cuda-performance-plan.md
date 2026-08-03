@@ -1,19 +1,17 @@
 # CUDA training performance plan
 
-**Status: cuBLAS/TF32 was rejected for the production GPU. The one-readback CUDA
-global gradient norm passed its matched cloud benchmark and is eligible for the
-next production resume.**
+**Status: the first cloud run is complete and its instance is gone. Device-side
+loss accumulation and the one-readback CUDA global gradient norm are in Forge.
+cuBLAS FP32 and TF32 remain selectable but were not faster on the tested RTX 5070 Ti.
+The next required gate is a physical-batch sweep on the exact GPU rented for the
+fresh Forge run.**
 
 ## Goal
 
 Increase end-to-end training throughput and lower cost per trained token without
-changing the model, token budget, optimizer schedule, checkpoint semantics, or
-validation quality. Optimizations are developed and proven against separate local
-checkpoints before the current cloud executable is eligible to be replaced.
-
-The current remote executable must not be replaced mid-run. Performance work will
-remain isolated from that process and each optimization will be tested, benchmarked,
-and committed independently.
+changing the selected Forge architecture, fixed 1.024B-token budget, optimizer
+schedule, checkpoint semantics, or validation quality. Each optimization is tested,
+benchmarked, and committed independently before it is used for a paid cloud run.
 
 ## Implementation record - 2026-08-02
 
@@ -44,10 +42,9 @@ gate and rejected both optimized modes for the production run. The RTX 2080 is S
 7.5 and cannot execute TF32, so its local TF32 test correctly verifies fail-loud
 capability gating.
 
-The other queued improvements remain recorded below: device-side loss accumulation,
-one-readback gradient norm, 16 GB batch sizing, remaining launch fusion, data
-prefetch, validation/checkpoint timing, and BF16 only after the FP32/TF32 path is
-settled.
+The remaining queued improvements are recorded below: cloud-GPU batch sizing,
+remaining launch fusion, data prefetch, validation/checkpoint timing, and BF16 only
+as a separately designed project.
 
 ### RTX 5070 Ti promotion benchmark - 2026-08-02
 
@@ -71,9 +68,9 @@ to the production run. The local RTX 2080 improvement therefore does not general
 to the Blackwell cloud GPU, and the next work should target synchronization/readback
 costs before revisiting library matmuls or cuBLASLt.
 
-## Current baseline
+## Historical first-run baseline
 
-The first production run on an RTX 5070 Ti establishes the initial baseline:
+The completed first production run on an RTX 5070 Ti established this baseline:
 
 - Model: 768 width, 12 layers, 12 heads, context 512, 110,434,688 parameters.
 - Physical batch: 4 sequences (2,048 tokens).
@@ -230,8 +227,8 @@ pressure and its run was terminated. Batch 4 remains the safe 8 GB choice. These
 numbers do not select the Vast configuration: repeat the same sweep on the exact
 cloud GPU before starting its full run, where 16-24 GB may favor a larger batch.
 
-The current batch of 4 was selected for an 8 GB RTX 2080, while the rented 5070 Ti
-uses only about 4.8 GB. Benchmark configurations that preserve exactly 32,768
+The batch of 4 was originally selected for an 8 GB RTX 2080, while the rented 5070 Ti
+used only about 4.8 GB. Benchmark configurations that preserve exactly 32,768
 tokens per optimizer update:
 
 | Physical batch | Accumulation | Tokens/update |
@@ -380,17 +377,18 @@ This task should have its own design review and milestone plan before implementa
 
 ## Recommended execution order
 
-1. Finish, download, verify, and close the current cloud run.
-2. Task 1: benchmark harness.
-3. Task 2: loss accumulation/readback.
-4. Task 3: global gradient-norm reduction.
-5. Task 4: physical batch sweep.
-6. Task 5: cuBLAS FP32.
-7. Task 6: opt-in TF32.
-8. Re-profile and select only justified work from Tasks 7-9.
-9. Treat BF16 as a new project if FP32/TF32 results leave enough value on the table.
+1. Publish the tested Forge commit to the selected Vast instance.
+2. Run the Task 4 sweep at batch/accum 4/16, 8/8, and 16/4 where memory permits;
+   compare custom and cuBLAS FP32 on that exact GPU.
+3. Prepare three FineWeb-Edu shards into `data/forge`, then verify the tokenizer,
+   EOS-delimited splits, manifests, and reported token counts.
+4. Run a short fixed-seed pilot with normal validation and checkpoint cadence.
+   Verify loss movement, generation, checkpoint reload, and exact resume.
+5. Start the fixed 1.024B-token Forge-98M run only after the pilot passes. Copy and
+   hash-verify checkpoints off-instance throughout the run and before destruction.
+6. Re-profile afterward and select only justified work from Tasks 7-9. Treat BF16
+   as a new project if the measured upside warrants its complexity.
 
-The first combined target is sustained average utilization above 75% and at least a
-25% end-to-end throughput improvement on the same RTX 5070 Ti class without a loss,
-resume, or checkpoint regression. This is a target rather than an excuse to combine
-changes: every result remains attributable to one reviewed commit.
+Throughput and utilization targets must be established against the selected Vast
+GPU's own repeatable baseline. Every retained change remains attributable to one
+reviewed commit; utilization alone is not a reason to accept a slower path.
