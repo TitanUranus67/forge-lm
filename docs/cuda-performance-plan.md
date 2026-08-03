@@ -1,7 +1,8 @@
 # CUDA training performance plan
 
-**Status: cuBLAS/TF32 was rejected for the production GPU. A one-readback CUDA
-global gradient norm is implemented and is awaiting its matched cloud benchmark.**
+**Status: cuBLAS/TF32 was rejected for the production GPU. The one-readback CUDA
+global gradient norm passed its matched cloud benchmark and is eligible for the
+next production resume.**
 
 ## Goal
 
@@ -170,9 +171,22 @@ empty-input, numerical-accuracy, and readback-count coverage.
 
 The matched six-update RTX 2080 production-shape benchmark increased final reported
 throughput from 1,025 to 1,045 tok/s (about 2.0%), with the same displayed final
-train/validation losses of 8.9707 / 8.9499. All 101 tests pass. This is a valid but
-small local gain; the fixed-checkpoint RTX 5070 Ti benchmark remains the promotion
-gate.
+train/validation losses of 8.9707 / 8.9499. All 101 tests pass.
+
+The fixed-step-4,401 RTX 5070 Ti promotion run then completed the same 20-update
+sample used by the previous custom-kernel control:
+
+| Gradient norm path | Updates | Training time | Measured throughput | Loss at step 4,417 |
+| --- | ---: | ---: | ---: | ---: |
+| Per-tensor scalar readbacks | 20 | 5:15 | 2,081 tok/s | 4.8393 |
+| One global scalar readback | 20 | 5:03 | 2,163 tok/s | 4.8393 |
+
+This is a 3.9% improvement over the matched control and 1.45% above the established
+2,132 tok/s production average. An instrumented run measured the new clipping phase
+at about 2 ms/update after warmup. The optimization therefore passes its promotion
+gate. At 2,163 tok/s, the 879,788,032 tokens remaining after step 4,401 are estimated
+at 113.0 hours (4.71 days) and $14.23 at $0.1259259259/hour, excluding normal
+validation/checkpoint overhead.
 
 Replace the per-parameter synchronization loop with a device-side global reduction:
 
