@@ -46,7 +46,10 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _nll;
     private int _nllLength;
     private MemoryBuffer1D<float, Stride1D.Dense>? _scalar;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _sumSquaresPartials;
+    private int _sumSquaresPartialsLength;
     private readonly float[] _scalarHost = new float[1];
+    private long _reductionReadbacks;
 
     private readonly Action<Index1D, CudaKernels.BinaryArgs> _addInPlace, _copy, _geluForward;
     private readonly Action<Index1D, CudaKernels.CopyBlockArgs> _copyBlock;
@@ -67,6 +70,8 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     private readonly Action<Index1D, CudaKernels.CrossEntropyBackwardArgs> _crossEntropyBackward;
     private readonly Action<KernelConfig, CudaKernels.MatMulArgs> _matMul;
     private readonly Action<KernelConfig, CudaKernels.SumSquaresArgs> _sumSquares;
+    private readonly Action<KernelConfig, CudaKernels.SumSquaresPartialsArgs> _sumSquaresPartialsKernel;
+    private readonly Action<KernelConfig, CudaKernels.ReduceSumArgs> _reduceSum;
     private readonly Action<Index1D, CudaKernels.AdamWArgs> _adamW;
 
     private readonly struct Chunk
@@ -147,6 +152,10 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             _matMul = accelerator.LoadStreamKernel<CudaKernels.MatMulArgs>(CudaKernels.MatMul);
             stage = nameof(CudaKernels.SumSquares);
             _sumSquares = accelerator.LoadStreamKernel<CudaKernels.SumSquaresArgs>(CudaKernels.SumSquares);
+            stage = nameof(CudaKernels.SumSquaresPartials);
+            _sumSquaresPartialsKernel = accelerator.LoadStreamKernel<CudaKernels.SumSquaresPartialsArgs>(CudaKernels.SumSquaresPartials);
+            stage = nameof(CudaKernels.ReduceSum);
+            _reduceSum = accelerator.LoadStreamKernel<CudaKernels.ReduceSumArgs>(CudaKernels.ReduceSum);
             stage = nameof(CudaKernels.AdamW);
             _adamW = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.AdamWArgs>(CudaKernels.AdamW);
 
@@ -210,6 +219,11 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     public (long Hits, long Carves) AllocStats
     {
         get { lock (_gate) return (_allocHits, _allocCarves); }
+    }
+
+    internal long ReductionReadbackCount
+    {
+        get { lock (_gate) return _reductionReadbacks; }
     }
 
     internal static int BucketOf(int length)
@@ -388,9 +402,51 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             _scalar ??= _accelerator.Allocate1D<float>(1);
             _sumSquares((1, 256), new CudaKernels.SumSquaresArgs(View(x, t.Length), _scalar.View, t.Length));
             _scalar.View.CopyToCPU(_scalarHost);
+            _reductionReadbacks++;
             return _scalarHost[0];
         }
     }
+
+    public double GlobalSumSquares(IReadOnlyList<TensorValue> tensors)
+    {
+        lock (_gate)
+        {
+            if (tensors.Count == 0) return 0;
+
+            int partialCount = 0;
+            for (int i = 0; i < tensors.Count; i++)
+                partialCount = checked(partialCount + SumSquaresGroupCount(tensors[i].Length));
+
+            if (_sumSquaresPartials is null || _sumSquaresPartialsLength < partialCount)
+            {
+                _accelerator.Synchronize();
+                _sumSquaresPartials?.Dispose();
+                _sumSquaresPartials = _accelerator.Allocate1D<float>(partialCount);
+                _sumSquaresPartialsLength = partialCount;
+            }
+            _scalar ??= _accelerator.Allocate1D<float>(1);
+
+            int partialOffset = 0;
+            for (int i = 0; i < tensors.Count; i++)
+            {
+                TensorValue tensor = tensors[i];
+                Chunk x = Read(tensor);
+                int numGroups = SumSquaresGroupCount(tensor.Length);
+                _sumSquaresPartialsKernel((numGroups, 256), new CudaKernels.SumSquaresPartialsArgs(
+                    View(x, tensor.Length), _sumSquaresPartials.View, tensor.Length, partialOffset, numGroups));
+                partialOffset += numGroups;
+            }
+
+            _reduceSum((1, 256), new CudaKernels.ReduceSumArgs(
+                _sumSquaresPartials.View.SubView(0, partialCount), _scalar.View, partialCount));
+            _scalar.View.CopyToCPU(_scalarHost);
+            _reductionReadbacks++;
+            return _scalarHost[0];
+        }
+    }
+
+    private static int SumSquaresGroupCount(int length) =>
+        Math.Min(256, Math.Max(1, (length + 255) / 256));
 
     public void AdamWStep(TensorValue w, TensorValue g, TensorValue m, TensorValue v,
         float lr, float beta1, float beta2, float eps, float weightDecay, int step)
@@ -711,7 +767,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             _disposed = true;
             _accelerator.Synchronize();
             _cuBlas?.Dispose(); _cuBlas = null;
-            _indices?.Dispose(); _nll?.Dispose(); _scalar?.Dispose();
+            _indices?.Dispose(); _nll?.Dispose(); _scalar?.Dispose(); _sumSquaresPartials?.Dispose();
             foreach ((WeakReference<TensorValue> owner, Entry entry) in _entries)
             {
                 if (owner.TryGetTarget(out TensorValue? tensor) && ReferenceEquals(tensor.DeviceResource, entry))

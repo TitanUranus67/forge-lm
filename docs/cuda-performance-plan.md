@@ -1,6 +1,7 @@
 # CUDA training performance plan
 
-**Status: cuBLAS/TF32 work is active locally; the current 1.024B-token cloud run remains untouched.**
+**Status: cuBLAS/TF32 was rejected for the production GPU. A one-readback CUDA
+global gradient norm is implemented and is awaiting its matched cloud benchmark.**
 
 ## Goal
 
@@ -159,6 +160,19 @@ benchmark shows a measurable improvement without additional memory growth.
 **Commit:** `Accumulate CUDA loss before host readback`
 
 ## Task 3 - Compute global gradient norm with one readback
+
+**Implementation status:** CUDA now performs block partial sum-of-squares reductions
+for every gradient tensor, finishes their global reduction on the device, and reads
+back one scalar per optimizer update. CPU and D3D12 retain the interface's existing
+fallback behavior. The implementation reuses its partial buffer, avoids per-update
+managed allocations, rejects non-finite norms, and has direct clipped, unclipped,
+empty-input, numerical-accuracy, and readback-count coverage.
+
+The matched six-update RTX 2080 production-shape benchmark increased final reported
+throughput from 1,025 to 1,045 tok/s (about 2.0%), with the same displayed final
+train/validation losses of 8.9707 / 8.9499. All 101 tests pass. This is a valid but
+small local gain; the fixed-checkpoint RTX 5070 Ti benchmark remains the promotion
+gate.
 
 Replace the per-parameter synchronization loop with a device-side global reduction:
 

@@ -12,6 +12,7 @@ namespace LLM.Core.Model
     {
         private readonly Dictionary<string, (Tensor Weight, Tensor Grad)> _map = new();
         private readonly List<string> _names = new();
+        private readonly List<Tensor> _grads = new();
         private readonly ITensorBackend? _backend;
 
         /// <summary>
@@ -32,6 +33,7 @@ namespace LLM.Core.Model
             var grad = new Tensor(shape);
             _map.Add(name, (weight, grad));
             _names.Add(name);
+            _grads.Add(grad);
             return weight;
         }
 
@@ -45,6 +47,9 @@ namespace LLM.Core.Model
 
         /// <summary>All parameter names in registration order.</summary>
         public IEnumerable<string> Names => _names;
+
+        /// <summary>All gradient tensors in the same deterministic registration order.</summary>
+        public IReadOnlyList<Tensor> Gradients => _grads;
 
         /// <summary>Total number of scalar parameters across all tensors.</summary>
         public long Count => _map.Values.Sum(e => (long)e.Weight.Length);

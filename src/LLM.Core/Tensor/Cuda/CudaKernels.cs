@@ -185,6 +185,23 @@ public static class CudaKernels
         { X = x; Result = result; Length = length; }
     }
 
+    public readonly struct SumSquaresPartialsArgs
+    {
+        public readonly ArrayView<float> X, Partials;
+        public readonly int Length, PartialOffset, NumGroups;
+        public SumSquaresPartialsArgs(ArrayView<float> x, ArrayView<float> partials,
+            int length, int partialOffset, int numGroups)
+        { X = x; Partials = partials; Length = length; PartialOffset = partialOffset; NumGroups = numGroups; }
+    }
+
+    public readonly struct ReduceSumArgs
+    {
+        public readonly ArrayView<float> Input, Result;
+        public readonly int Length;
+        public ReduceSumArgs(ArrayView<float> input, ArrayView<float> result, int length)
+        { Input = input; Result = result; Length = length; }
+    }
+
     public readonly struct AdamWArgs
     {
         public readonly ArrayView<float> W, G, M, V;
@@ -463,6 +480,33 @@ public static class CudaKernels
         float sum = 0f;
         for (int i = lane; i < a.Length; i += 256)
         { float x = a.X[i]; sum += x * x; }
+        reduction[lane] = sum;
+        Group.Barrier();
+        for (int s = 128; s > 0; s >>= 1)
+        { if (lane < s) reduction[lane] += reduction[lane + s]; Group.Barrier(); }
+        if (lane == 0) a.Result[0] = reduction[0];
+    }
+
+    public static void SumSquaresPartials(SumSquaresPartialsArgs a)
+    {
+        int group = Grid.IdxX, lane = Group.IdxX;
+        ArrayView<float> reduction = SharedMemory.Allocate<float>(256);
+        float sum = 0f;
+        for (int i = group * 256 + lane; i < a.Length; i += a.NumGroups * 256)
+        { float x = a.X[i]; sum += x * x; }
+        reduction[lane] = sum;
+        Group.Barrier();
+        for (int s = 128; s > 0; s >>= 1)
+        { if (lane < s) reduction[lane] += reduction[lane + s]; Group.Barrier(); }
+        if (lane == 0) a.Partials[a.PartialOffset + group] = reduction[0];
+    }
+
+    public static void ReduceSum(ReduceSumArgs a)
+    {
+        int lane = Group.IdxX;
+        ArrayView<float> reduction = SharedMemory.Allocate<float>(256);
+        float sum = 0f;
+        for (int i = lane; i < a.Length; i += 256) sum += a.Input[i];
         reduction[lane] = sum;
         Group.Barrier();
         for (int s = 128; s > 0; s >>= 1)

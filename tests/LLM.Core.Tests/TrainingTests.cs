@@ -86,6 +86,25 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void ClipGradNorm_NonFiniteFailsLoudly()
+        {
+            var p = new Parameters();
+            p.Add("w", 2, 2);
+            p.Grad("w").Data[0] = float.NaN;
+
+            bool threw = false;
+            try
+            {
+                Trainer.ClipGradNorm(p, B, 1f);
+            }
+            catch (InvalidOperationException ex)
+            {
+                threw = ex.Message.Contains("non-finite", StringComparison.OrdinalIgnoreCase);
+            }
+            Check.True(threw, "non-finite global gradient norm fails loudly");
+        }
+
+        [Test]
         public static void DataLoader_SampleIsContiguousShiftedWindow()
         {
             string path = Path.GetTempFileName();

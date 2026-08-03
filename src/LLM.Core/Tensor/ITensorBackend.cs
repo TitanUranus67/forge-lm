@@ -176,6 +176,18 @@ public interface ITensorBackend
     }
 
     /// <summary>
+    /// Sum of squares across a collection of tensors. The default preserves the
+    /// per-tensor behavior; device backends can override this to perform one global
+    /// reduction and a single host readback for gradient clipping.
+    /// </summary>
+    double GlobalSumSquares(IReadOnlyList<Tensor> tensors)
+    {
+        double sum = 0;
+        foreach (Tensor tensor in tensors) sum += SumSquares(tensor);
+        return sum;
+    }
+
+    /// <summary>
     /// One AdamW update over a parameter: m/v moment EMAs with bias correction
     /// (<paramref name="step"/> is 1-based) and decoupled weight decay for rank &gt; 1
     /// tensors when <paramref name="weightDecay"/> != 0. The default runs the update on

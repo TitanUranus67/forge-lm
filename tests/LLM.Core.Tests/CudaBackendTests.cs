@@ -186,6 +186,73 @@ public static class CudaBackendTests
     }
 
     [Test]
+    public static void GlobalSumSquares_MatchesCpuWithOneReadback()
+    {
+        if (Skip()) return;
+        CudaBackend cuda = Cuda!;
+        var rng = new Random(914);
+        int[] lengths = { 1, 257, 4097, 1_000_003 };
+        var tensors = new List<Tensor>();
+        double expected = 0;
+        foreach (int length in lengths)
+        {
+            var values = new float[length];
+            for (int i = 0; i < values.Length; i++)
+            {
+                values[i] = (float)((rng.NextDouble() * 2 - 1) * 0.1);
+                expected += (double)values[i] * values[i];
+            }
+            tensors.Add(new Tensor(values, length));
+        }
+
+        long before = cuda.ReductionReadbackCount;
+        double actual = cuda.GlobalSumSquares(tensors);
+        long after = cuda.ReductionReadbackCount;
+        double relativeError = Math.Abs(actual - expected) / Math.Max(1.0, expected);
+        Check.True(relativeError < 2e-5,
+            $"CUDA global sum-squares relative error {relativeError:G4} < 2e-5");
+        Check.True(after - before == 1, "CUDA global sum-squares performs one scalar readback");
+
+        before = cuda.ReductionReadbackCount;
+        actual = cuda.GlobalSumSquares(Array.Empty<Tensor>());
+        after = cuda.ReductionReadbackCount;
+        Check.True(actual == 0, "empty CUDA global sum-squares is zero");
+        Check.True(after == before, "empty CUDA global sum-squares performs no readback");
+    }
+
+    [Test]
+    public static void ClipGradNorm_ClipsAndSkipsWithOneReadback()
+    {
+        if (Skip()) return;
+        CudaBackend cuda = Cuda!;
+        var clipped = new Parameters(cuda);
+        clipped.Add("a", 1);
+        clipped.Add("b", 1);
+        clipped.Grad("a").Data[0] = 3f;
+        clipped.Grad("b").Data[0] = 4f;
+
+        long before = cuda.ReductionReadbackCount;
+        Trainer.ClipGradNorm(clipped, cuda, 1f);
+        long after = cuda.ReductionReadbackCount;
+        cuda.EnsureHostCurrent(clipped.Grad("a"));
+        cuda.EnsureHostCurrent(clipped.Grad("b"));
+        Check.Near(clipped.Grad("a").Data[0], 0.6f, 1e-6f, "CUDA clipped gradient a");
+        Check.Near(clipped.Grad("b").Data[0], 0.8f, 1e-6f, "CUDA clipped gradient b");
+        Check.True(after - before == 1, "CUDA clipped norm performs one scalar readback");
+
+        var unchanged = new Parameters(cuda);
+        unchanged.Add("g", 2);
+        unchanged.Grad("g").Data[0] = 0.1f;
+        unchanged.Grad("g").Data[1] = -0.2f;
+        before = cuda.ReductionReadbackCount;
+        Trainer.ClipGradNorm(unchanged, cuda, 1f);
+        after = cuda.ReductionReadbackCount;
+        Check.Near(unchanged.Grad("g").Data[0], 0.1f, 0f, "CUDA unclipped gradient 0");
+        Check.Near(unchanged.Grad("g").Data[1], -0.2f, 0f, "CUDA unclipped gradient 1");
+        Check.True(after - before == 1, "CUDA unclipped norm performs one scalar readback");
+    }
+
+    [Test]
     public static void BucketOf_IdempotentAlignedAndBounded()
     {
         Check.True(CudaBackend.BucketOf(1) == 16, "min CUDA bucket is 16");

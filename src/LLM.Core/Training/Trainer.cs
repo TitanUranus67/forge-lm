@@ -211,13 +211,13 @@ namespace LLM.Core.Training
         }
 
         /// <summary>Scales all gradients so the global L2 norm does not exceed maxNorm.</summary>
-        private static void ClipGradNorm(Parameters p, ITensorBackend backend, float maxNorm)
+        internal static void ClipGradNorm(Parameters p, ITensorBackend backend, float maxNorm)
         {
             if (maxNorm <= 0f) return;
-            double sumSq = 0;
-            foreach (string name in p.Names)
-                sumSq += backend.SumSquares(p.Grad(name)); // device-side reduction when supported
+            double sumSq = backend.GlobalSumSquares(p.Gradients);
             float norm = MathF.Sqrt((float)sumSq);
+            if (!float.IsFinite(norm))
+                throw new InvalidOperationException("Global gradient norm is non-finite.");
             if (norm <= maxNorm || norm == 0f) return;
             float scale = maxNorm / norm;
             foreach (string name in p.Names)
