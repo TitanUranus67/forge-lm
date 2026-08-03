@@ -8,18 +8,15 @@ namespace LLM.Core.Checkpoint
     using LLM.Core.Training;
 
     /// <summary>
-    /// Versioned, deterministic binary checkpoints. V1 contains model configuration
-    /// and weights. V2 additionally contains the complete resumable training state:
-    /// cumulative global step, LR schedule/configuration, sampler RNG state, Adam age,
-    /// and first/second moment tensors. V3 adds input identities and a SHA-256 trailer.
-    /// Every version remains loadable for inference.
+    /// Deterministic, checksummed training checkpoints for the tied-embedding model.
+    /// A checkpoint contains model weights, cumulative scheduler position, sampler
+    /// state, Adam age and moments, and exact tokenizer/data identities.
     /// </summary>
     public static class Checkpoint
     {
-        private static readonly byte[] MagicV1 = "LLMSCRATCH1"u8.ToArray();
-        private static readonly byte[] MagicV2 = "LLMSCRATCH2"u8.ToArray();
-        private static readonly byte[] MagicV3 = "LLMSCRATCH3"u8.ToArray();
+        private static readonly byte[] Magic = "LLMSCRATCH4"u8.ToArray();
         private const int ChecksumBytes = 32;
+        private const string Architecture = "gpt2-tied-v1";
 
         private sealed class Header
         {
@@ -28,6 +25,7 @@ namespace LLM.Core.Checkpoint
             public int DModel { get; set; }
             public int NLayers { get; set; }
             public int NHeads { get; set; }
+            public string Architecture { get; set; } = "";
             public string[] Names { get; set; } = [];
             public TrainingHeader? Training { get; set; }
         }
@@ -36,8 +34,14 @@ namespace LLM.Core.Checkpoint
         {
             public int GlobalStep { get; set; }
             public int AdamStep { get; set; }
-            public ulong DataRngState { get; set; }
-            public ulong DataRngIncrement { get; set; }
+            public ulong SamplerRandomState { get; set; }
+            public ulong SamplerRandomIncrement { get; set; }
+            public long SamplerEpoch { get; set; }
+            public long SamplerCursor { get; set; }
+            public long SamplerStart { get; set; }
+            public long SamplerStride { get; set; }
+            public long SamplerChunkCount { get; set; }
+            public int SamplerContextLength { get; set; }
             public bool HasOptimizerState { get; set; }
             public int TotalSteps { get; set; }
             public float MaxLr { get; set; }
@@ -54,16 +58,7 @@ namespace LLM.Core.Checkpoint
 
         public sealed record LoadedTrainingCheckpoint(GptModel Model, TrainingState? TrainingState,
             string? TokenizerIdentity = null)
-        {
-            public bool IsWeightsOnly => TrainingState is null;
-        }
-
-        /// <summary>Writes a legacy-compatible model-only checkpoint.</summary>
-        public static void Save(GptModel model, string path)
-        {
-            Header header = CreateModelHeader(model);
-            WriteHeaderAndWeights(model, path, MagicV1, header, writeExtraPayload: null, checksum: false);
-        }
+        { }
 
         /// <summary>Writes model weights plus all state required for exact training continuation.</summary>
         public static void SaveTraining(GptModel model, TrainingState state, string path)
@@ -79,8 +74,14 @@ namespace LLM.Core.Checkpoint
             {
                 GlobalStep = state.GlobalStep,
                 AdamStep = state.Optimizer.StepCount,
-                DataRngState = state.DataRandom.State,
-                DataRngIncrement = state.DataRandom.Increment,
+                SamplerRandomState = state.DataSampler.RandomState,
+                SamplerRandomIncrement = state.DataSampler.RandomIncrement,
+                SamplerEpoch = state.DataSampler.Epoch,
+                SamplerCursor = state.DataSampler.Cursor,
+                SamplerStart = state.DataSampler.Start,
+                SamplerStride = state.DataSampler.Stride,
+                SamplerChunkCount = state.DataSampler.ChunkCount,
+                SamplerContextLength = state.DataSampler.ContextLength,
                 HasOptimizerState = hasOptimizerState,
                 TotalSteps = c.TotalSteps,
                 MaxLr = c.MaxLr,
@@ -97,7 +98,7 @@ namespace LLM.Core.Checkpoint
 
             Dictionary<string, (Tensor M, Tensor V)> moments = state.Optimizer.StateEntries
                 .ToDictionary(e => e.Name, e => (e.M, e.V));
-            WriteHeaderAndWeights(model, path, MagicV3, header, bw =>
+            WriteHeaderAndWeights(model, path, Magic, header, bw =>
             {
                 if (!hasOptimizerState) return;
                 foreach (string name in model.Params.Names)
@@ -108,10 +109,10 @@ namespace LLM.Core.Checkpoint
                     WriteTensor(bw, m);
                     WriteTensor(bw, v);
                 }
-            }, checksum: true);
+            });
         }
 
-        /// <summary>Loads either checkpoint version for inference, ignoring V2 optimizer payload.</summary>
+        /// <summary>Loads a checkpoint for inference, ignoring its optimizer payload.</summary>
         public static GptModel Load(string path, ITensorBackend backend) =>
             LoadCore(path, backend, restoreTrainingState: false).Model;
 
@@ -120,8 +121,7 @@ namespace LLM.Core.Checkpoint
             LoadCore(path, backend, restoreTrainingState: false);
 
         /// <summary>
-        /// Loads model and training state. V1 files return a null state because their
-        /// optimizer, scheduler, global step, and RNG were never serialized.
+        /// Loads the complete model and training state.
         /// </summary>
         public static LoadedTrainingCheckpoint LoadTraining(string path, ITensorBackend backend) =>
             LoadCore(path, backend, restoreTrainingState: true);
@@ -133,18 +133,19 @@ namespace LLM.Core.Checkpoint
             DModel = model.Config.DModel,
             NLayers = model.Config.NLayers,
             NHeads = model.Config.NHeads,
+            Architecture = Architecture,
             Names = model.Params.Names.ToArray(),
         };
 
         private static void WriteHeaderAndWeights(GptModel model, string path, byte[] magic,
-            Header header, Action<BinaryWriter>? writeExtraPayload, bool checksum)
+            Header header, Action<BinaryWriter>? writeExtraPayload)
         {
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(header);
             using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20,
                 FileOptions.SequentialScan);
-            using var hasher = checksum ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;
-            using var hashingStream = checksum ? new HashingWriteStream(fs, hasher!) : null;
-            Stream payload = (Stream?)hashingStream ?? fs;
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var hashingStream = new HashingWriteStream(fs, hasher);
+            Stream payload = hashingStream;
             using var bw = new BinaryWriter(payload, Encoding.UTF8, leaveOpen: true);
             bw.Write(magic);
             bw.Write(json.Length);
@@ -157,8 +158,7 @@ namespace LLM.Core.Checkpoint
             }
             writeExtraPayload?.Invoke(bw);
             bw.Flush();
-            if (hasher is not null)
-                fs.Write(hasher.GetHashAndReset());
+            fs.Write(hasher.GetHashAndReset());
             fs.Flush(flushToDisk: true);
         }
 
@@ -172,21 +172,18 @@ namespace LLM.Core.Checkpoint
             bool restoreTrainingState)
         {
             using var fs = OpenCheckpointRead(path);
-            byte[] magic = new byte[MagicV1.Length];
+            byte[] magic = new byte[Magic.Length];
             fs.ReadExactly(magic);
-            bool isV1 = magic.SequenceEqual(MagicV1);
-            bool isV2 = magic.SequenceEqual(MagicV2);
-            bool isV3 = magic.SequenceEqual(MagicV3);
-            if (!isV1 && !isV2 && !isV3)
-                throw new InvalidDataException($"'{path}' is not an LLMSCRATCH checkpoint (bad magic).");
+            if (!magic.SequenceEqual(Magic))
+                throw new InvalidDataException($"'{path}' is not a current LLMSCRATCH4 checkpoint.");
 
-            long contentLength = isV3 ? fs.Length - ChecksumBytes : fs.Length;
+            long contentLength = fs.Length - ChecksumBytes;
             if (contentLength < fs.Position)
                 throw new InvalidDataException("Checkpoint is too short to contain its checksum.");
-            using var hasher = isV3 ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;
-            hasher?.AppendData(magic);
-            using var hashingStream = isV3 ? new HashingReadStream(fs, hasher!, contentLength - fs.Position) : null;
-            Stream payload = (Stream?)hashingStream ?? fs;
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            hasher.AppendData(magic);
+            using var hashingStream = new HashingReadStream(fs, hasher, contentLength - fs.Position);
+            Stream payload = hashingStream;
             using var br = new BinaryReader(payload, Encoding.UTF8, leaveOpen: true);
 
             int jsonLength = br.ReadInt32();
@@ -197,7 +194,9 @@ namespace LLM.Core.Checkpoint
                 throw new InvalidDataException("Checkpoint ended inside its JSON header.");
             Header header = JsonSerializer.Deserialize<Header>(json)
                 ?? throw new InvalidDataException("Checkpoint header failed to parse.");
-            if ((isV2 || isV3) && header.Training is null)
+            if (header.Architecture != Architecture)
+                throw new InvalidDataException($"Unsupported checkpoint architecture '{header.Architecture}'.");
+            if (header.Training is null)
                 throw new InvalidDataException("Training checkpoint is missing its training-state header.");
 
             var config = new ModelConfig(header.VocabSize, header.ContextLength,
@@ -221,9 +220,9 @@ namespace LLM.Core.Checkpoint
                 backend.InvalidateDeviceCache(weight);
             }
 
-            if (isV1 || !restoreTrainingState)
+            if (!restoreTrainingState)
             {
-                if (isV3) DrainAndVerifyChecksum(fs, hashingStream!, hasher!);
+                DrainAndVerifyChecksum(fs, hashingStream, hasher);
                 return new LoadedTrainingCheckpoint(model, null, header.Training?.TokenizerIdentity);
             }
 
@@ -249,10 +248,12 @@ namespace LLM.Core.Checkpoint
             var trainingConfig = new TrainingConfiguration(t.TotalSteps, t.MaxLr, t.MinLr,
                 t.WarmupSteps, t.WeightDecay, t.GradClip, t.BatchSize,
                 Math.Max(1, t.AccumulationSteps), t.TrainingContextLength);
-            var rng = new TrainingRandom(t.DataRngState, t.DataRngIncrement);
-            var state = new TrainingState(t.GlobalStep, optimizer, rng, trainingConfig,
+            var sampler = new TrainingSampler(t.SamplerRandomState, t.SamplerRandomIncrement,
+                t.SamplerEpoch, t.SamplerCursor, t.SamplerStart, t.SamplerStride,
+                t.SamplerChunkCount, t.SamplerContextLength);
+            var state = new TrainingState(t.GlobalStep, optimizer, sampler, trainingConfig,
                 t.DataIdentity, t.TokenizerIdentity);
-            if (isV3) DrainAndVerifyChecksum(fs, hashingStream!, hasher!);
+            DrainAndVerifyChecksum(fs, hashingStream, hasher);
             return new LoadedTrainingCheckpoint(model, state, t.TokenizerIdentity);
         }
 

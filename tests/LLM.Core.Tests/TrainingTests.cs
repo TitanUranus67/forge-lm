@@ -116,12 +116,12 @@ namespace LLM.Core.Tests
                 var loader = new DataLoader(path);
                 Check.True(loader.Length == 1000, $"Length {loader.Length} should be 1000");
 
-                var rng = new Random(7);
+                var sampler = new TrainingSampler(7);
                 const int ctx = 8;
                 int[] inputs = new int[ctx], targets = new int[ctx];
                 for (int trial = 0; trial < 200; trial++)
                 {
-                    loader.Sample(rng, ctx, inputs, targets);
+                    loader.Sample(sampler, ctx, inputs, targets);
                     Check.True(inputs[0] >= 0 && inputs[0] <= 1000 - ctx - 1,
                         $"offset {inputs[0]} within bounds");
                     for (int i = 0; i < ctx; i++)
@@ -148,12 +148,12 @@ namespace LLM.Core.Tests
                 using var loader = new DataLoader(path, inMemoryLimit: 0);
                 Check.True(loader.Length == 1000, $"Length {loader.Length} should be 1000");
 
-                var rng = new Random(7);
+                var sampler = new TrainingSampler(7);
                 const int ctx = 8;
                 int[] inputs = new int[ctx], targets = new int[ctx];
                 for (int trial = 0; trial < 200; trial++)
                 {
-                    loader.Sample(rng, ctx, inputs, targets);
+                    loader.Sample(sampler, ctx, inputs, targets);
                     int o = inputs[0] / 3; // ids[i] = i*3, all unique multiples of 3
                     Check.True(inputs[0] % 3 == 0, $"offset id is a multiple of 3");
                     for (int i = 0; i < ctx; i++)
@@ -164,6 +164,28 @@ namespace LLM.Core.Tests
                 }
             }
             finally { File.Delete(path); }
+        }
+
+        [Test]
+        public static void DataLoader_VisitsEveryWindowBeforeRepeating()
+        {
+            const int ctx = 8;
+            int[] ids = Enumerable.Range(0, 81).ToArray(); // exactly ten full shifted windows
+            using var loader = new DataLoader(ids);
+            var sampler = new TrainingSampler(17);
+            int[] inputs = new int[ctx], targets = new int[ctx];
+            var firstEpoch = new HashSet<int>();
+
+            for (int i = 0; i < 10; i++)
+            {
+                loader.Sample(sampler, ctx, inputs, targets);
+                Check.True(inputs[0] % ctx == 0, $"window {inputs[0]} is context aligned");
+                Check.True(firstEpoch.Add(inputs[0]), $"window {inputs[0]} is not repeated in the epoch");
+            }
+
+            Check.True(firstEpoch.Count == 10, "all complete windows are visited once");
+            loader.Sample(sampler, ctx, inputs, targets);
+            Check.True(sampler.Epoch == 1, "the next sample starts a new shuffled epoch");
         }
 
         [Test]

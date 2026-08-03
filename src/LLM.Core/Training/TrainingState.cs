@@ -16,17 +16,17 @@ namespace LLM.Core.Training
 
     /// <summary>
     /// Mutable state required to continue training rather than merely reload weights:
-    /// cumulative scheduler position, Adam moments/age, and data-sampler RNG state.
+    /// cumulative scheduler position, Adam moments/age, and exact data-sampler position.
     /// </summary>
     public sealed class TrainingState
     {
-        internal TrainingState(int globalStep, AdamW optimizer, TrainingRandom dataRandom,
+        internal TrainingState(int globalStep, AdamW optimizer, TrainingSampler dataSampler,
             TrainingConfiguration configuration, string? dataIdentity = null, string? tokenizerIdentity = null)
         {
             if (globalStep < 0) throw new ArgumentOutOfRangeException(nameof(globalStep));
             GlobalStep = globalStep;
             Optimizer = optimizer;
-            DataRandom = dataRandom;
+            DataSampler = dataSampler;
             Configuration = configuration;
             DataIdentity = dataIdentity;
             TokenizerIdentity = tokenizerIdentity;
@@ -34,17 +34,17 @@ namespace LLM.Core.Training
 
         public int GlobalStep { get; internal set; }
         public AdamW Optimizer { get; }
-        public TrainingRandom DataRandom { get; }
+        public TrainingSampler DataSampler { get; }
         public TrainingConfiguration Configuration { get; }
         public string? DataIdentity { get; private set; }
         public string? TokenizerIdentity { get; private set; }
 
         public static TrainingState CreateNew(ITensorBackend backend, TrainOptions options, int globalStep = 0,
             string? dataIdentity = null, string? tokenizerIdentity = null) =>
-            new(globalStep, new AdamW(backend), new TrainingRandom(options.Seed), FromOptions(options),
+            new(globalStep, new AdamW(backend), new TrainingSampler(options.Seed), FromOptions(options),
                 dataIdentity, tokenizerIdentity);
 
-        /// <summary>Binds a legacy checkpoint once, or verifies that a bound checkpoint uses the same inputs.</summary>
+        /// <summary>Verifies that a checkpoint uses the same prepared inputs.</summary>
         public void RequireDataIdentity(string dataIdentity, string tokenizerIdentity)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(dataIdentity);

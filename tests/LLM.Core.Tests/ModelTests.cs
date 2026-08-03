@@ -14,10 +14,10 @@ namespace LLM.Core.Tests
     {
         private static readonly CpuBackend B = new();
 
-        /// <summary>Small config for most tests: 7776 parameters.</summary>
+        /// <summary>Small config for most tests: 7232 parameters with tied embeddings.</summary>
         private static ModelConfig Small => new(VocabSize: 32, ContextLength: 8, DModel: 16, NLayers: 2, NHeads: 2);
 
-        /// <summary>Even tinier config for the gradient check: 1140 parameters.</summary>
+        /// <summary>Even tinier config for the gradient check.</summary>
         private static ModelConfig Tiny => new(VocabSize: 12, ContextLength: 6, DModel: 8, NLayers: 1, NHeads: 2);
 
         [Test]
@@ -35,8 +35,10 @@ namespace LLM.Core.Tests
             for (int v = 0; v < Small.VocabSize; v++)
                 Check.Near(last.Data[v], logits.Data[(tokens.Length - 1) * Small.VocabSize + v], 0f, $"ForwardLast row equals last logits row [{v}]");
 
-            // VD + CD + L*(12D^2+13D) + 2D + (D+1)*V = 512 + 128 + 2*3280 + 32 + 544
-            Check.True(model.Params.Count == 7776, $"param count {model.Params.Count} should be 7776");
+            // VD + CD + L*(12D^2+13D) + 2D; output projection reuses VD.
+            Check.True(model.Params.Count == 7232, $"param count {model.Params.Count} should be 7232");
+            Check.True(!model.Params.Names.Any(name => name.StartsWith("head.", StringComparison.Ordinal)),
+                "tied output projection registers no independent head parameters");
         }
 
         [Test]

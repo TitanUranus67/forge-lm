@@ -17,6 +17,17 @@ namespace LLM.Core.Tests
 
         private static ModelConfig Small => new(VocabSize: 32, ContextLength: 8, DModel: 16, NLayers: 2, NHeads: 2);
 
+        private static TrainingState FreshState() => TrainingState.CreateNew(B, new TrainOptions
+        {
+            Steps = 2,
+            MaxLr = 1e-3f,
+            MinLr = 1e-4f,
+            WarmupSteps = 1,
+            ContextLength = Small.ContextLength,
+            BatchSize = 1,
+            ValEvery = 0,
+        }, dataIdentity: "data", tokenizerIdentity: "tokenizer");
+
         [Test]
         public static void RoundTrip_BitwiseEqualWeightsAndLogits()
         {
@@ -27,7 +38,7 @@ namespace LLM.Core.Tests
                 int[] tokens = { 5, 6, 7, 8 };
                 Tensor before = model.ForwardLast(tokens);
 
-                Checkpoint.Save(model, path);
+                Checkpoint.SaveTraining(model, FreshState(), path);
                 GptModel loaded = Checkpoint.Load(path, B);
 
                 Check.True(loaded.Config == Small, "config round-trips");
@@ -85,7 +96,7 @@ namespace LLM.Core.Tests
                 Checkpoint.SaveTraining(interrupted, state, checkpointPath);
 
                 Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(checkpointPath, B);
-                Check.True(loaded.TrainingState is not null, "V2 checkpoint restores training state");
+                Check.True(loaded.TrainingState is not null, "checkpoint restores training state");
                 Check.True(loaded.TrainingState!.GlobalStep == 3, "global step round-trips");
                 Check.True(loaded.TrainingState.Optimizer.StepCount == 3, "Adam age round-trips");
                 Check.True(loaded.TrainingState.DataIdentity == "data-A", "training data identity round-trips");
@@ -105,7 +116,7 @@ namespace LLM.Core.Tests
                 Check.True(loaded.TrainingState.Optimizer.StepCount == 6, "resumed Adam age reaches target");
 
                 GptModel inferenceOnly = Checkpoint.Load(checkpointPath, B);
-                Check.True(inferenceOnly.Config == Small, "inference loader accepts V2 checkpoint");
+                Check.True(inferenceOnly.Config == Small, "inference loader accepts training checkpoint");
             }
             finally
             {
@@ -136,7 +147,7 @@ namespace LLM.Core.Tests
             try
             {
                 var model = new GptModel(Small, B, new Random(1));
-                Checkpoint.Save(model, path);
+                Checkpoint.SaveTraining(model, FreshState(), path);
                 // chop 4 bytes: float count no longer matches the registry
                 byte[] bytes = File.ReadAllBytes(path);
                 File.WriteAllBytes(path, bytes.AsSpan(0, bytes.Length - 4).ToArray());

@@ -62,7 +62,7 @@ internal static partial class Cli
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
                         [--valbatches 50] [--valseed 424242]
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
-                        [--resume-step N] [--backend auto|cpu|gpu|cuda]
+                        [--backend auto|cpu|gpu|cuda]
                         [--matmul-precision custom|fp32|tf32]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
@@ -231,24 +231,17 @@ internal static partial class Cli
         int cut = (int)(ids.Length * 0.9);
         int trainTokens = cut;
         int valTokens = ids.Length - cut;
-        if (tok.EosTokenId is int eos)
-        {
-            var trainIds = new int[trainTokens + 1];
-            ids.AsSpan(0, trainTokens).CopyTo(trainIds);
-            trainIds[^1] = eos;
-            var valIds = new int[valTokens + 1];
-            ids.AsSpan(cut).CopyTo(valIds);
-            valIds[^1] = eos;
-            WriteIds(Path.Combine(outDir, "train.bin"), trainIds);
-            WriteIds(Path.Combine(outDir, "val.bin"), valIds);
-            trainTokens++;
-            valTokens++;
-        }
-        else
-        {
-            WriteIds(Path.Combine(outDir, "train.bin"), ids.AsSpan(0, cut));
-            WriteIds(Path.Combine(outDir, "val.bin"), ids.AsSpan(cut));
-        }
+        int eos = tok.EosTokenId;
+        var trainIds = new int[trainTokens + 1];
+        ids.AsSpan(0, trainTokens).CopyTo(trainIds);
+        trainIds[^1] = eos;
+        var valIds = new int[valTokens + 1];
+        ids.AsSpan(cut).CopyTo(valIds);
+        valIds[^1] = eos;
+        WriteIds(Path.Combine(outDir, "train.bin"), trainIds);
+        WriteIds(Path.Combine(outDir, "val.bin"), valIds);
+        trainTokens++;
+        valTokens++;
 
         int totalTokens = trainTokens + valTokens;
         Console.WriteLine($"train.bin: {trainTokens:N0} tokens, val.bin: {valTokens:N0} tokens");
@@ -271,12 +264,10 @@ internal static partial class Cli
                   `prepare`, and writes a checkpoint to --out (default out/model.bin).
                   Each physical pass processes --batch sequences (default 8); --accum
                   physical passes are averaged into each optimizer update (default 16).
-                  --init resumes a V2/V3 training checkpoint exactly (model, Adam,
-                  global step, LR schedule, and sampler RNG). V3 also verifies a
-                  SHA-256 checksum plus tokenizer/training-data identity and rotates
-                  the previous save to .bak. V1 checkpoints contain weights
-                  only; --resume-step N can supply their known cumulative scheduler
-                  position during the one-time upgrade. Architecture flags are ignored
+                  --init resumes a current training checkpoint exactly (model, Adam,
+                  global step, LR schedule, sampler, and input identities). Checkpoints
+                  are SHA-256 verified and the previous save rotates to .bak.
+                  Architecture flags are ignored
                   when loading. --saveevery N writes the checkpoint every N global
                   steps. --backend cuda runs on NVIDIA CUDA (including Linux);
                   --backend gpu runs on Windows D3D12, and auto chooses safely.
@@ -313,7 +304,6 @@ internal static partial class Cli
         int valseed = p.GetInt("valseed", 424242);
         string outPath = p.Get("out", Path.Combine("out", "model.bin"));
         string? init = p.Get("init");
-        int resumeStep = p.GetInt("resume-step", 0);
         int saveevery = p.GetInt("saveevery", 0);
         string backendName = p.Get("backend", "auto");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
@@ -331,16 +321,13 @@ internal static partial class Cli
         {
             Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(init, backend);
             model = loaded.Model;
-            trainState = loaded.TrainingState;
-            string resumeDescription = trainState is null
-                ? "legacy weights-only checkpoint"
-                : $"training state at global step {trainState.GlobalStep:N0} (Adam step {trainState.Optimizer.StepCount:N0})";
+            trainState = loaded.TrainingState
+                ?? throw new InvalidDataException("Training checkpoint did not contain resumable state.");
+            string resumeDescription =
+                $"training state at global step {trainState.GlobalStep:N0} (Adam step {trainState.Optimizer.StepCount:N0})";
             Console.WriteLine($"model: loaded {init} ({resumeDescription}; " +
                               $"vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                               $"dmodel {model.Config.DModel}, layers {model.Config.NLayers}, heads {model.Config.NHeads})");
-            if (trainState is null)
-                Console.WriteLine("warning: this V1 checkpoint has no Adam/RNG/scheduler state; " +
-                                  "this restart must initialize those once before future resumes become exact.");
         }
         else
         {
@@ -350,11 +337,6 @@ internal static partial class Cli
             Console.WriteLine($"model: vocab {config.VocabSize}, ctx {ctx}, dmodel {dmodel}, " +
                               $"layers {layers}, heads {heads}, params {model.Params.Count:N0}");
         }
-
-        if (trainState is not null && resumeStep != 0)
-            throw new ArgumentException("--resume-step is only valid when upgrading a legacy V1 weights-only checkpoint.");
-        if (init is null && resumeStep != 0)
-            throw new ArgumentException("--resume-step requires --init with a legacy V1 weights-only checkpoint.");
 
         TrainingConfiguration? stored = trainState?.Configuration;
         int batch = batchArg ?? stored?.BatchSize ?? 8;
@@ -404,7 +386,7 @@ internal static partial class Cli
         string tokenizerIdentity = ContentSha256(Path.Combine(dataDir, "tokenizer.json"));
         string dataIdentity = CombinedIdentity(tokenizerIdentity,
             ContentSha256(Path.Combine(dataDir, "train.bin")), ContentSha256(Path.Combine(dataDir, "val.bin")));
-        trainState ??= TrainingState.CreateNew(backend, opts, resumeStep, dataIdentity, tokenizerIdentity);
+        trainState ??= TrainingState.CreateNew(backend, opts, 0, dataIdentity, tokenizerIdentity);
         trainState.RequireDataIdentity(dataIdentity, tokenizerIdentity);
 
         var display = new TrainDisplay(steps, checked((int)tokensPerUpdate), trainState.GlobalStep);
@@ -508,15 +490,13 @@ internal static partial class Cli
         Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(
             modelPath, CreateBackend(backendName, cudaMatMulMode));
         string tokenizerIdentity = ContentSha256(tokPath);
-        if (loaded.TokenizerIdentity is not null && loaded.TokenizerIdentity != tokenizerIdentity)
+        if (loaded.TokenizerIdentity != tokenizerIdentity)
             throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");
-        if (loaded.TokenizerIdentity is null)
-            Console.WriteLine("warning: legacy checkpoint has no tokenizer identity to verify.");
         GptModel model = loaded.Model;
         Console.WriteLine($"model: {modelPath} (vocab {model.Config.VocabSize}, ctx {model.Config.ContextLength}, " +
                           $"params {model.Params.Count:N0})");
 
-        int[] promptIds = prompt.Length > 0 ? tok.Encode(prompt) : tok.Encode("\n");
+        int[] promptIds = prompt.Length > 0 ? tok.Encode(prompt) : [tok.EosTokenId];
         var rng = new Random(seed);
 
         Console.WriteLine("---");
@@ -575,10 +555,8 @@ internal static partial class Cli
         Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadWithMetadata(
             modelPath, CreateBackend(backendName, cudaMatMulMode));
         string tokenizerIdentity = ContentSha256(tokPath);
-        if (loaded.TokenizerIdentity is not null && loaded.TokenizerIdentity != tokenizerIdentity)
+        if (loaded.TokenizerIdentity != tokenizerIdentity)
             throw new InvalidDataException("Tokenizer does not match the tokenizer recorded in the checkpoint.");
-        if (loaded.TokenizerIdentity is null)
-            Console.WriteLine("warning: legacy checkpoint has no tokenizer identity to verify.");
         GptModel model = loaded.Model;
         var rng = new Random(seed);
 
@@ -586,7 +564,7 @@ internal static partial class Cli
                           $"params {model.Params.Count:N0})");
         Console.WriteLine("chat — type a line and the model continues it. /reset clears context, /quit exits.");
 
-        var history = new List<int>(tok.Encode("\n"));
+        var history = new List<int> { tok.EosTokenId };
         while (true)
         {
             Console.Write("\nyou> ");
@@ -595,7 +573,7 @@ internal static partial class Cli
             if (line is "/reset")
             {
                 history.Clear();
-                history.AddRange(tok.Encode("\n"));
+                history.Add(tok.EosTokenId);
                 Console.WriteLine("(context cleared)");
                 continue;
             }

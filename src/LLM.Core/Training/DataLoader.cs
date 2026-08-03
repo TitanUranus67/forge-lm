@@ -3,11 +3,10 @@ namespace LLM.Core.Training;
 using System.IO.MemoryMappedFiles;
 
 /// <summary>
-/// Random-access sampler over a prepared token file: raw little-endian uint16
+/// Window loader over a prepared token file: raw little-endian uint16
 /// token ids, no header. The model trains on single sequences, so one call to
 /// <see cref="Sample"/> yields one (inputs, targets) pair offset by one token.
-/// Splitting a corpus into train/val is the caller's job — see
-/// <see cref="Split"/>.
+/// Splitting a corpus into train/val is the caller's job.
 /// Files larger than <see cref="DefaultInMemoryLimit"/> are memory-mapped and
 /// paged on demand instead of being loaded fully (train.bin can exceed 2GB).
 /// </summary>
@@ -43,7 +42,7 @@ public sealed class DataLoader : IDisposable
         }
     }
 
-    /// <summary>Wraps an in-memory token array (e.g. one half of a <see cref="Split"/>).</summary>
+    /// <summary>Wraps an in-memory token array.</summary>
     public DataLoader(int[] ids)
     {
         if (ids.Length < 2) throw new ArgumentException("Need at least 2 tokens.");
@@ -55,26 +54,14 @@ public sealed class DataLoader : IDisposable
     public long Length => _length;
 
     /// <summary>
-    /// Picks a uniform random offset and fills <paramref name="inputs"/> and
+    /// Selects the next no-replacement window and fills <paramref name="inputs"/> and
     /// <paramref name="targets"/> (both of length <paramref name="contextLength"/>)
     /// with inputs[i] = ids[o+i], targets[i] = ids[o+i+1].
     /// </summary>
-    public void Sample(Random rng, int contextLength, int[] inputs, int[] targets)
+    public void Sample(TrainingSampler sampler, int contextLength, int[] inputs, int[] targets)
     {
         ValidateSampleArguments(contextLength, inputs, targets);
-        long bound = _length - contextLength;
-        long offset = bound <= int.MaxValue ? rng.Next((int)bound) : rng.NextInt64(bound);
-        FillSample(offset, contextLength, inputs, targets);
-    }
-
-    /// <summary>
-    /// Checkpointable equivalent of <see cref="Sample(Random,int,int[],int[])"/> used by training.
-    /// </summary>
-    public void Sample(TrainingRandom rng, int contextLength, int[] inputs, int[] targets)
-    {
-        ValidateSampleArguments(contextLength, inputs, targets);
-        long bound = _length - contextLength;
-        long offset = bound <= int.MaxValue ? rng.Next((int)bound) : rng.NextInt64(bound);
+        long offset = sampler.NextOffset(_length, contextLength);
         FillSample(offset, contextLength, inputs, targets);
     }
 
@@ -106,20 +93,6 @@ public sealed class DataLoader : IDisposable
                 targets[i] = _view!.ReadUInt16(basePos + (long)(i + 1) * 2);
             }
         }
-    }
-
-    /// <summary>
-    /// Splits an in-memory token array into train/val loaders; the first
-    /// (1 - valFraction) of the tokens become the train split.
-    /// </summary>
-    public static (DataLoader Train, DataLoader Val) Split(int[] ids, float valFraction = 0.1f)
-    {
-        if (valFraction <= 0f || valFraction >= 1f)
-            throw new ArgumentException("valFraction must be in (0,1).");
-        int cut = (int)(ids.Length * (1f - valFraction));
-        if (cut < 2 || ids.Length - cut < 2)
-            throw new ArgumentException("Split leaves a split with fewer than 2 tokens.");
-        return (new DataLoader(ids.AsSpan(0, cut).ToArray()), new DataLoader(ids.AsSpan(cut).ToArray()));
     }
 
     /// <summary>Releases the memory-mapped view, if any.</summary>

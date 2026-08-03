@@ -36,7 +36,7 @@ out/gpt1.bin             checkpoint
 ```
 
 The FineWeb corpus text and parquet shards are not needed for training once the
-three prepared data files exist. Preserve their bytes exactly: V3 checkpoints
+three prepared data files exist. Preserve their bytes exactly: checkpoints
 verify the tokenizer and train/validation identities before resuming.
 
 Allow enough free disk for the data plus checkpoint rotation. A save can

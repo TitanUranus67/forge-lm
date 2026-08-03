@@ -368,7 +368,7 @@ internal static partial class Cli
     private static long StreamEncode(BpeTokenizer tok, string corpusPath, string documentIndexPath,
         long expectedDocuments, string tmpBin, Stopwatch sw)
     {
-        int eos = tok.EosTokenId ?? throw new InvalidDataException("FineWeb tokenizer has no EOS token.");
+        int eos = tok.EosTokenId;
         var outBuf = new byte[1 << 20];
         int outFill = 0;
         long tokens = 0, documents = 0, nextReport = EncodeChunkSize;

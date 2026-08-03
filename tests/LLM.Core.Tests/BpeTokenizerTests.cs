@@ -144,19 +144,16 @@ public static class BpeTokenizerTests
     }
 
     [Test]
-    public static void Load_LegacyV1TokenizerWithoutEos()
+    public static void Load_RejectsObsoleteTokenizerFormat()
     {
         string path = Path.GetTempFileName();
         try
         {
             File.WriteAllText(path, "{\"Version\":1,\"Merges\":[]}");
-            var legacy = BpeTokenizer.Load(path);
-            Check.True(legacy.VocabSize == 256, "legacy V1 vocabulary remains unchanged");
-            Check.True(legacy.EosTokenId is null, "legacy V1 tokenizer reports no EOS token");
-            Check.True(legacy.Decode(legacy.Encode("legacy text")) == "legacy text", "legacy tokenizer still round-trips");
-
-            legacy.Save(path);
-            Check.True(BpeTokenizer.Load(path).EosTokenId is null, "saving a V1 tokenizer does not invent EOS");
+            bool threw = false;
+            try { BpeTokenizer.Load(path); }
+            catch (InvalidDataException) { threw = true; }
+            Check.True(threw, "obsolete tokenizer formats are rejected");
         }
         finally
         {

@@ -85,14 +85,12 @@ fail loudly if unavailable. The selected backend and device are printed at start
   ETA and elapsed time (it falls back to plain log lines when output is piped);
   pressing `p` pauses (resume, save+resume, or save+quit). Checkpoints are written
   at the end, every `--saveevery N` steps, and on Ctrl+C (the run finishes its
-  current step, then saves) — an interrupted run is never lost. V2+ training
-  checkpoints preserve the global step, Adam moments, LR schedule, and sampler RNG,
-  so `--init` continues the same trajectory instead of restarting warmup. Legacy V1
-  model-only checkpoints still load; `--resume-step` can provide their known global
-  scheduler position during the one-time upgrade. New V3 saves add a SHA-256 trailer,
-  bind the checkpoint to its tokenizer and training data, and rotate the previous
-  generation to `<checkpoint>.bak`. Loading V1/V2 remains supported; the next save
-  upgrades it. Startup hashes the input files before an optimizer update.
+  current step, then saves) — an interrupted run is never lost. Training
+  checkpoints preserve the global step, Adam moments, LR schedule, and complete
+  no-replacement sampler position, so `--init` continues the same trajectory instead
+  of restarting warmup or repeating data. Saves include a SHA-256 trailer, bind the
+  checkpoint to its tokenizer and training data, and rotate the previous generation
+  to `<checkpoint>.bak`. Startup hashes the input files before an optimizer update.
 - `generate` loads a checkpoint and samples autoregressively with temperature
   and top-k filtering. An incremental UTF-8 decoder preserves characters whose
   bytes span token boundaries. Generation stops when EOS is sampled or when
@@ -103,13 +101,13 @@ fail loudly if unavailable. The selected backend and device are printed at start
 ## Architecture
 
 - **BPE tokenizer** (`Tokenizer/BpeTokenizer.cs`) — byte-level, GPT-2 style.
-  Ids 0–255 are raw bytes, learned merges produce ids 256+, and V2 tokenizers
-  append a dedicated EOS id. Encoding is rank-greedy; arbitrary bytes remain
-  representable and valid UTF-8 text round-trips losslessly. Legacy V1
-  tokenizers without EOS remain loadable.
+  Ids 0–255 are raw bytes, learned merges produce ids 256+, and every tokenizer
+  appends a dedicated EOS id. Encoding is rank-greedy; arbitrary bytes remain
+  representable and valid UTF-8 text round-trips losslessly.
 - **GPT model** (`Model/`) — GPT-2 architecture: learned token + positional
   embeddings, pre-LN transformer blocks (multi-head causal self-attention +
-  GELU MLP), final LayerNorm, untied output head. Training is batched: B
+  GELU MLP), final LayerNorm, and an output projection tied to the token embedding
+  table. Training is batched: B
   sequences of length T are stacked row-wise into `[B*T, C]` tensors and
   processed in one pass (attention never crosses sequence boundaries); the
   (sequence, head) attention slots are packed into slot-contiguous tensors and
@@ -117,8 +115,8 @@ fail loudly if unavailable. The selected backend and device are printed at start
   is no KV cache.
 - **Training** (`Training/`) — AdamW (decoupled weight decay on 2-D params),
   averaged gradient accumulation, linear-warmup + cosine-decay in optimizer-update
-  units, global gradient-norm clipping, and a checkpointable random-offset data
-  loader over raw uint16 token files, including files beyond 2.147 billion tokens.
+  units, global gradient-norm clipping, and a checkpointable O(1)-memory affine
+  sampler that visits every complete context window once before reshuffling.
 - **CPU backend** (`Tensor/CpuBackend.cs`) — all math through an
   `ITensorBackend` interface; the CPU implementation uses `Vector<T>` SIMD in
   the matmul inner loops. Large matmuls parallelize over output rows with
@@ -146,11 +144,10 @@ fail loudly if unavailable. The selected backend and device are printed at start
   Tensor storage is sub-allocated from reusable 64 MB CUDA arenas and remains
   device-resident; tests enforce numerical agreement with CPU, full-model
   gradients, overfit behavior, aliasing, and a steady-state allocation plateau.
-- **Checkpoints** (`Checkpoint/Checkpoint.cs`) — versioned custom binary format.
-  `LLMSCRATCH1` is the legacy model-only format. `LLMSCRATCH2` adds cumulative step,
-  schedule/configuration, sampler RNG, Adam age, and first/second moment tensors to
-  the model weights. `LLMSCRATCH3` adds input identities and a SHA-256 checksum.
-  Loading validates the exact payload size and parameter registry.
+- **Checkpoints** (`Checkpoint/Checkpoint.cs`) — the `LLMSCRATCH4` custom binary
+  format stores the tied-model architecture, cumulative step, schedule/configuration,
+  complete sampler position, Adam age and moments, input identities, and a SHA-256
+  checksum. Loading validates the exact payload size, architecture, and parameter registry.
   Checkpoints are backend-agnostic: train on GPU, generate on CPU or vice versa.
 
 ## Accelerator backend notes

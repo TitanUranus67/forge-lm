@@ -25,7 +25,7 @@ namespace LLM.Core.Training
         public int BatchSize { get; init; } = 8;
         /// <summary>Physical batches accumulated and averaged before one optimizer update.</summary>
         public int AccumulationSteps { get; init; } = 1;
-        /// <summary>RNG seed for data sampling (and therefore reproducibility).</summary>
+        /// <summary>Seed for deterministic epoch permutations.</summary>
         public int Seed { get; init; } = 1337;
         /// <summary>Emit a log record every this many steps.</summary>
         public int LogEvery { get; init; } = 50;
@@ -33,7 +33,7 @@ namespace LLM.Core.Training
         public int ValEvery { get; init; } = 0;
         /// <summary>Number of deterministic physical-size val batches averaged per evaluation.</summary>
         public int ValBatches { get; init; } = 50;
-        /// <summary>Seed defining the fixed validation sample set (independent of training RNG).</summary>
+        /// <summary>Seed defining the fixed validation sample set (independent of training sampling).</summary>
         public int ValSeed { get; init; } = 424242;
         /// <summary>Invoke the save callback every this many steps; 0 disables it.</summary>
         public int SaveEvery { get; init; } = 0;
@@ -116,7 +116,7 @@ namespace LLM.Core.Training
             int accumulation = opts.AccumulationSteps;
             state ??= TrainingState.CreateNew(model.Backend, opts);
             state.RequireCompatible(opts);
-            TrainingRandom rng = state.DataRandom;
+            TrainingSampler sampler = state.DataSampler;
             AdamW adam = state.Optimizer;
             int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
@@ -138,7 +138,7 @@ namespace LLM.Core.Training
                 {
                     for (int b = 0; b < batch; b++)
                     {
-                        train.Sample(rng, ctx, seqInputs, seqTargets);
+                        train.Sample(sampler, ctx, seqInputs, seqTargets);
                         Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
                         Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
                     }
@@ -187,13 +187,13 @@ namespace LLM.Core.Training
         /// <summary>
         /// Forward-only mean over a fixed validation set. Batches are evaluated one at
         /// a time so increasing sample count does not increase peak activation memory.
-        /// A fresh dedicated RNG makes every evaluation directly comparable and keeps
+        /// A fresh dedicated sampler makes every evaluation directly comparable and keeps
         /// validation from perturbing the training sampler trajectory.
         /// </summary>
         private static float EvalLoss(GptModel model, DataLoader data, int ctx, int batch,
             int valBatches, int valSeed)
         {
-            var rng = new TrainingRandom(valSeed);
+            var sampler = new TrainingSampler(valSeed);
             int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
             double lossSum = 0;
@@ -201,7 +201,7 @@ namespace LLM.Core.Training
             {
                 for (int b = 0; b < batch; b++)
                 {
-                    data.Sample(rng, ctx, seqInputs, seqTargets);
+                    data.Sample(sampler, ctx, seqInputs, seqTargets);
                     Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
                     Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
                 }

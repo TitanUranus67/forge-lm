@@ -5,7 +5,7 @@ namespace LLM.Core.Model
 
     /// <summary>
     /// GPT language model (GPT-2 architecture, pre-LN, learned positional embeddings,
-    /// untied output head). Training runs batched: B sequences of length T are stacked
+    /// tied token-embedding/output weights). Training runs batched: B sequences of length T are stacked
     /// row-wise into [B*T, C] tensors (sequence b occupies rows b*T..(b+1)*T) and
     /// processed in one pass — attention never crosses sequence boundaries. Inference
     /// uses the single-sequence path (B = 1); there is no KV cache. All parameter
@@ -15,7 +15,7 @@ namespace LLM.Core.Model
     ///   tok_emb, pos_emb,
     ///   blocks.{i}.ln1.{w,b}, blocks.{i}.attn.qkv.{w,b}, blocks.{i}.attn.proj.{w,b},
     ///   blocks.{i}.ln2.{w,b}, blocks.{i}.mlp.fc.{w,b}, blocks.{i}.mlp.proj.{w,b},
-    ///   ln_f.{w,b}, head.{w,b}
+    ///   ln_f.{w,b}
     /// </summary>
     public sealed class GptModel
     {
@@ -26,7 +26,7 @@ namespace LLM.Core.Model
         private readonly Embedding _tokEmb, _posEmb;
         private readonly TransformerBlock[] _blocks;
         private readonly LayerNorm _lnF;
-        private readonly Linear _head;
+        private readonly TiedOutputProjection _head;
 
         // caches for Backward
         private int[]? _lastTokens;
@@ -81,13 +81,11 @@ namespace LLM.Core.Model
                 _blocks[i] = new TransformerBlock(backend, ln1, attn, ln2, mlp);
             }
 
-            // final layernorm + untied output head
+            // final layernorm + output projection tied to the token embedding table
             p.Add("ln_f.w", d).Fill(1f);
             p.Add("ln_f.b", d);
             _lnF = new LayerNorm(backend, p.Weight("ln_f.w"), p.Grad("ln_f.w"), p.Weight("ln_f.b"), p.Grad("ln_f.b"));
-            p.Add("head.w", d, config.VocabSize).FillNormal(rng, std);
-            p.Add("head.b", config.VocabSize);
-            _head = new Linear(backend, p.Weight("head.w"), p.Grad("head.w"), p.Weight("head.b"), p.Grad("head.b"));
+            _head = new TiedOutputProjection(backend, p.Weight("tok_emb"), p.Grad("tok_emb"));
 
             _positions = new int[config.ContextLength];
             for (int i = 0; i < _positions.Length; i++) _positions[i] = i;

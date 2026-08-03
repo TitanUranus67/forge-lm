@@ -57,6 +57,47 @@ namespace LLM.Core.Model
     }
 
     /// <summary>
+    /// Vocabulary projection that reuses the token embedding table. The shared
+    /// table is stored [V,D], so forward uses x * table^T and backward adds the
+    /// output-projection gradient into the same tensor used by embedding lookup.
+    /// </summary>
+    public sealed class TiedOutputProjection
+    {
+        private readonly ITensorBackend _backend;
+        private readonly Tensor _table, _dTable;
+        private Tensor? _x;
+
+        public TiedOutputProjection(ITensorBackend backend, Tensor table, Tensor dTable)
+        {
+            _backend = backend;
+            _table = table;
+            _dTable = dTable;
+        }
+
+        public int VocabSize => _table.Shape[0];
+        public int DModel => _table.Shape[1];
+
+        public Tensor Forward(Tensor x)
+        {
+            _x = x;
+            var logits = new Tensor(x.Shape[0], VocabSize);
+            _backend.MatMulNT(x, _table, logits, x.Shape[0], DModel, VocabSize);
+            return logits;
+        }
+
+        public Tensor Backward(Tensor dLogits)
+        {
+            Tensor x = _x ?? throw new InvalidOperationException("Forward must run before Backward.");
+            _x = null;
+            int rows = x.Shape[0];
+            _backend.MatMulTN(dLogits, x, _dTable, VocabSize, rows, DModel, accumulate: true);
+            var dX = new Tensor(rows, DModel);
+            _backend.MatMulNN(dLogits, _table, dX, rows, VocabSize, DModel);
+            return dX;
+        }
+    }
+
+    /// <summary>
     /// Row-wise layer normalization y = (x - mean)/sqrt(var+eps) * w + b over rows of x [T,C].
     /// Caches x, mean and rstd for Backward.
     /// </summary>
