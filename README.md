@@ -23,8 +23,8 @@ The CLI has five subcommands (tokenizer training is folded into `prepare`):
 # 1. Download tiny-shakespeare, train a BPE tokenizer, encode to train/val bins
 dotnet run --project src/LLM.Cli -- prepare --out data/shakes --merges 2000
 
-# 1b. Or build a real corpus: download N FineWeb (sample-10BT) shards from
-#     Hugging Face, extract text, train tokenizer, stream-encode (takes hours)
+# 1b. Or build a real corpus: download N FineWeb-Edu (sample-10BT) shards,
+#     isolate validation by URL, train tokenizer, and stream-encode (takes hours)
 dotnet run --project src/LLM.Cli -- prepare-fineweb --out data/fineweb --shards 10 --merges 16000
 
 # 2. Train a small GPT (checkpoint written to out/model.bin)
@@ -55,15 +55,19 @@ fail loudly if unavailable. The selected backend and device are printed at start
   trains or loads a tokenizer (`tokenizer.json`), encodes the corpus, and writes
   a 90/10 split of raw little-endian uint16 token files (`train.bin`, `val.bin`).
 - `prepare-fineweb` builds a large-scale corpus from
-  [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) (`sample-10BT`
-  config): it lists the parquet shards via the Hugging Face API, downloads the
-  first `--shards N` (default 10, ~2.1 GB each) into `<out>/shards/` (existing
+  [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu)
+  (`sample-10BT` config) by default; `--dataset fineweb` selects unfiltered
+  FineWeb. It lists parquet shards via the Hugging Face API, downloads the
+  first `--shards N` (default 10) into `<out>/shards/<dataset>/` (existing
   complete shards are skipped, so interrupted runs resume), extracts the `text`
   column into `<out>/corpus.txt` with a document-length index at
   `<out>/corpus.idx` via
   [Parquet.Net](https://github.com/aloneguid/parquet-dotnet) (CLI-only
-  dependency), trains the tokenizer on the first `--toktrainmb` MB only
-  (default 200), then stream-encodes every document followed by EOS — a multi-GB
+  dependency). A stable URL hash assigns whole documents to train or validation,
+  preventing the same URL from crossing splits. The tokenizer trains on a
+  deterministic corpus-wide sample of training documents (`--toktrainmb`, default
+  200 MB), and BPE merges cannot cross document boundaries. Preparation then
+  stream-encodes every document followed by EOS — a multi-GB
   corpus never has to fit in memory. Encoding is the slow
   phase (tens of minutes to hours depending on merges/corpus size); progress in
   MB is printed per chunk. Corpus, tokenizer, and bin artifacts are published

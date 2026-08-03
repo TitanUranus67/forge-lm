@@ -95,17 +95,45 @@ public sealed class BpeTokenizer
     public static BpeTokenizer Train(byte[] corpus, int numMerges, Action<int, int>? onProgress = null)
     {
         ArgumentNullException.ThrowIfNull(corpus);
+        return TrainDocuments([corpus], numMerges, onProgress);
+    }
+
+    /// <summary>
+    /// Trains on separate documents without allowing a merge to cross a document
+    /// boundary. This prevents the tokenizer from learning artifacts that encoding
+    /// individual documents can never reproduce.
+    /// </summary>
+    public static BpeTokenizer TrainDocuments(IReadOnlyList<byte[]> documents, int numMerges,
+        Action<int, int>? onProgress = null)
+    {
+        ArgumentNullException.ThrowIfNull(documents);
         ArgumentOutOfRangeException.ThrowIfNegative(numMerges);
 
         var tok = new BpeTokenizer();
-        int len = corpus.Length;
+        long byteCount = 0;
+        foreach (byte[] document in documents)
+        {
+            ArgumentNullException.ThrowIfNull(document);
+            byteCount = checked(byteCount + document.Length);
+        }
+        long sequenceLength = checked(byteCount + Math.Max(0, documents.Count - 1));
+        if (sequenceLength > int.MaxValue)
+            throw new ArgumentException("Tokenizer training input exceeds the supported in-memory size.", nameof(documents));
+
+        int len = (int)sequenceLength;
         var seq = new int[len];
-        for (int i = 0; i < len; i++) seq[i] = corpus[i];
+        int seqPos = 0;
+        for (int documentIndex = 0; documentIndex < documents.Count; documentIndex++)
+        {
+            if (documentIndex > 0) seq[seqPos++] = -1; // unmergeable boundary sentinel
+            foreach (byte value in documents[documentIndex]) seq[seqPos++] = value;
+        }
 
         // Adjacent-pair counts over the current token sequence, built once.
         var counts = new Dictionary<long, int>();
         for (int i = 0; i + 1 < len; i++)
         {
+            if (seq[i] < 0 || seq[i + 1] < 0) continue;
             ref int c = ref CollectionsMarshal.GetValueRefOrAddDefault(counts, PairKey(seq[i], seq[i + 1]), out _);
             c++;
         }
@@ -122,6 +150,7 @@ public sealed class BpeTokenizer
 
         void ChangeCount(long key, int delta)
         {
+            if ((int)(key >> 32) < 0 || (int)key < 0) return;
             ref int c = ref CollectionsMarshal.GetValueRefOrAddDefault(counts, key, out _);
             c += delta;
             changed.Add(key);

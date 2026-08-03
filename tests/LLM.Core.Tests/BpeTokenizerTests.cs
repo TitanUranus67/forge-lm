@@ -70,6 +70,23 @@ public static class BpeTokenizerTests
     }
 
     [Test]
+    public static void TrainDocuments_DoesNotMergeAcrossBoundaries()
+    {
+        byte[][] documents =
+        [
+            Encoding.UTF8.GetBytes("a"),
+            Encoding.UTF8.GetBytes("b"),
+            Encoding.UTF8.GetBytes("a"),
+            Encoding.UTF8.GetBytes("b"),
+        ];
+        var tok = BpeTokenizer.TrainDocuments(documents, 10);
+
+        Check.True(tok.VocabSize == 257,
+            "pairs that exist only across document boundaries do not become merges");
+        Check.True(tok.Encode("ab").Length == 2, "cross-document pair remains separate during encoding");
+    }
+
+    [Test]
     public static void Encode_CompressesRepetitiveText()
     {
         var tok = BpeTokenizer.Train(Encoding.UTF8.GetBytes(Corpus), 300);

@@ -55,7 +55,8 @@ internal static partial class Cli
 
         Usage:
           llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
-          llm prepare-fineweb --out <dir> [--shards 10] [--merges 16000] [--toktrainmb 200] [--rebuild true]
+          llm prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb] [--shards 10]
+                              [--merges 16000] [--toktrainmb 200] [--rebuild true]
           llm train     --data <dir> [--steps 5000 | --tokens N] [--dmodel 128] [--layers 4] [--heads 4]
                         [--ctx 128] [--batch 8] [--accum 16] [--lr 6e-4] [--minlr 6e-5]
                         [--warmup 100 | --warmup-tokens N] [--wd 0.1]
