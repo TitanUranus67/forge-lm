@@ -96,8 +96,11 @@ namespace LLM.Core.Tests
                         state: state);
                 Checkpoint.SaveTraining(interrupted, state, checkpointPath);
 
-                Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(checkpointPath, B);
+                Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(checkpointPath, B,
+                    cacheAttentionActivations: true);
                 Check.True(loaded.TrainingState is not null, "checkpoint restores training state");
+                Check.True(loaded.Model.CachesAttentionActivations,
+                    "runtime attention-cache choice applies when loading a checkpoint");
                 Check.True(loaded.TrainingState!.GlobalStep == 3, "global step round-trips");
                 Check.True(loaded.TrainingState.Optimizer.StepCount == 3, "Adam age round-trips");
                 Check.True(loaded.TrainingState.DataIdentity == "data-A", "training data identity round-trips");

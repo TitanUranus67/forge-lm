@@ -170,6 +170,32 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void AttentionActivationCache_MatchesRecomputation()
+        {
+            var recomputed = new GptModel(Small, B, new Random(71));
+            var cached = new GptModel(Small, B, new Random(71),
+                cacheAttentionActivations: true);
+            var (inputs, targets) = MakeBatch(batch: 3, ctx: Small.ContextLength,
+                vocab: Small.VocabSize, seed: 72);
+
+            recomputed.Params.ZeroGrads();
+            float recomputedLoss = recomputed.ForwardBackward(inputs, targets, batch: 3);
+            cached.Params.ZeroGrads();
+            float cachedLoss = cached.ForwardBackward(inputs, targets, batch: 3);
+
+            Check.True(!recomputed.CachesAttentionActivations,
+                "attention recomputation remains the default");
+            Check.True(cached.CachesAttentionActivations,
+                "attention activation caching is explicitly enabled");
+            Check.Near(cachedLoss, recomputedLoss, 0f,
+                "attention activation caching preserves loss");
+            foreach (string name in recomputed.Params.Names)
+                Check.SpanNear(cached.Params.Grad(name).Data,
+                    recomputed.Params.Grad(name).Data, 0f,
+                    $"attention activation caching preserves gradient: {name}");
+        }
+
+        [Test]
         public static void Trainer_BatchedTrainLossDrops()
         {
             // Repetitive data: next token is fully predictable (i -> (i+1) mod 16).

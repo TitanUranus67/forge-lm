@@ -156,15 +156,16 @@ namespace LLM.Core.Model
         private readonly int _nHeads, _headDim, _dModel;
         private readonly float _invScale;
 
-        // forward cache: the fused QKV projection output [B*T, 3D]. The packed
-        // Q/K/V and attention probs are NOT cached — Backward rebuilds them from
-        // this one tensor (3 packs + the scores matmul + softmax), which cuts the
-        // per-layer activation cache by ~4x (one [B*T,3D] instead of three packed
-        // [B*H*T,HD] plus the [B*H*T,T] probs) at ~1% extra compute.
+        // In the low-memory mode, only the fused QKV projection output is cached and
+        // Backward rebuilds packed Q/K/V plus attention probabilities. The opt-in
+        // high-memory mode retains those activations and skips the rebuild.
+        private readonly bool _cacheActivations;
         private Tensor? _qkv;
+        private Tensor? _q, _k, _v, _probs;
         private int _t, _batch = 1;
 
-        public MultiHeadAttention(ITensorBackend backend, int nHeads, int dModel, Linear qkv, Linear proj)
+        public MultiHeadAttention(ITensorBackend backend, int nHeads, int dModel,
+            Linear qkv, Linear proj, bool cacheActivations = false)
         {
             _b = backend;
             _nHeads = nHeads;
@@ -173,6 +174,7 @@ namespace LLM.Core.Model
             _invScale = 1f / MathF.Sqrt(_headDim);
             Qkv = qkv;
             Proj = proj;
+            _cacheActivations = cacheActivations;
         }
 
         /// <summary>Fused QKV projection [DModel, 3*DModel].</summary>
@@ -213,29 +215,48 @@ namespace LLM.Core.Model
             var concat = new Tensor(rows, _dModel);
             _b.UnpackHeads(ctx, concat, batch, t, _nHeads, hd, 0);
 
-            _qkv = qkv;
+            if (_cacheActivations)
+            {
+                _qkv = null;
+                _q = q; _k = k; _v = v; _probs = probs;
+            }
+            else
+            {
+                _qkv = qkv;
+                _q = _k = _v = _probs = null;
+            }
             return Proj.Forward(concat);
         }
 
         /// <summary>Backward: dY [B*T,D] -&gt; dX [B*T,D]; accumulates into Qkv/Proj parameter grads.</summary>
         public Tensor Backward(Tensor dY)
         {
-            if (_qkv is null)
-                throw new InvalidOperationException("Forward must run before Backward.");
             int t = _t, batch = _batch;
             int slots = batch * _nHeads;
             int hd = _headDim;
             Tensor dConcat = Proj.Backward(dY); // [B*T,D]
 
-            // rebuild the packed forward caches from the fused QKV projection
-            var q = new Tensor(slots * t, hd);
-            var k = new Tensor(slots * t, hd);
-            var v = new Tensor(slots * t, hd);
-            _b.PackQkvHeads(_qkv, q, k, v, batch, t, _nHeads, hd);
-            var probs = new Tensor(slots * t, t);
-            _b.BatchedMatMulNT(q, k, probs, slots, t, hd, t);
-            _b.ScaledCausalSoftmaxForward(probs, slots * t, t, _invScale);
-            _qkv = null; // release the forward cache right after the rebuild
+            Tensor q, k, v, probs;
+            if (_cacheActivations)
+            {
+                q = _q ?? throw new InvalidOperationException("Forward must run before Backward.");
+                k = _k ?? throw new InvalidOperationException("Forward must run before Backward.");
+                v = _v ?? throw new InvalidOperationException("Forward must run before Backward.");
+                probs = _probs ?? throw new InvalidOperationException("Forward must run before Backward.");
+                _q = _k = _v = _probs = null;
+            }
+            else
+            {
+                Tensor qkv = _qkv ?? throw new InvalidOperationException("Forward must run before Backward.");
+                q = new Tensor(slots * t, hd);
+                k = new Tensor(slots * t, hd);
+                v = new Tensor(slots * t, hd);
+                _b.PackQkvHeads(qkv, q, k, v, batch, t, _nHeads, hd);
+                probs = new Tensor(slots * t, t);
+                _b.BatchedMatMulNT(q, k, probs, slots, t, hd, t);
+                _b.ScaledCausalSoftmaxForward(probs, slots * t, t, _invScale);
+                _qkv = null; // release the compact forward cache after the rebuild
+            }
 
             var dCtx = new Tensor(slots * t, hd);
             _b.PackHeads(dConcat, dCtx, batch, t, _nHeads, hd, 0);

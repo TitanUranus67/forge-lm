@@ -35,12 +35,14 @@ namespace LLM.Core.Model
         private int[]? _batchPositions;
         private int _batchPosT = -1, _batchPosBatch = -1;
 
-        public GptModel(ModelConfig config, ITensorBackend backend, Random rng, string name = "Forge")
+        public GptModel(ModelConfig config, ITensorBackend backend, Random rng, string name = "Forge",
+            bool cacheAttentionActivations = false)
         {
             if (string.IsNullOrWhiteSpace(name) || name.Length > 64)
                 throw new ArgumentException("Model name must contain 1-64 non-whitespace characters.", nameof(name));
             Name = name;
             Config = config;
+            CachesAttentionActivations = cacheAttentionActivations;
             _b = backend;
             var p = new Parameters(backend);
             int d = config.DModel;
@@ -76,7 +78,7 @@ namespace LLM.Core.Model
                 var ln1 = MakeLn("ln1");
                 var attn = new MultiHeadAttention(backend, config.NHeads, d,
                     MakeLinear("attn.qkv", d, 3 * d, std),
-                    MakeLinear("attn.proj", d, d, residStd));
+                    MakeLinear("attn.proj", d, d, residStd), cacheAttentionActivations);
                 var ln2 = MakeLn("ln2");
                 var mlp = new Mlp(backend,
                     MakeLinear("mlp.fc", d, config.MlpHidden, std),
@@ -107,6 +109,13 @@ namespace LLM.Core.Model
 
         /// <summary>Model hyperparameters.</summary>
         public ModelConfig Config { get; }
+
+        /// <summary>
+        /// True when training retains packed Q/K/V and attention probabilities for
+        /// backward instead of recomputing them. This changes only activation memory
+        /// and execution time; parameters and checkpoints are unchanged.
+        /// </summary>
+        public bool CachesAttentionActivations { get; }
 
         /// <summary>
         /// Forward pass over one sequence: returns logits [T, Vocab] and caches all

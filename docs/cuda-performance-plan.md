@@ -124,6 +124,35 @@ as a rollback, and production resumed from the exact global/Adam step 5,840
 checkpoint with the fused binary. Its first two normal 16-update production logs
 reached 5,563 and 5,690 tok/s with train losses 4.2524 and 4.3407.
 
+### RTX 5090 attention activation cache - 2026-08-05
+
+Forge's low-memory attention path retained only the fused QKV projection and rebuilt
+packed Q/K/V plus attention probabilities during backward. That tradeoff was needed
+on the original 8 GB development GPU, but the production RTX 5090 had enough unused
+memory to avoid the recomputation. Forge now has an opt-in `--cache-attention true`
+mode; recomputation remains the portable default. The flag changes only transient
+activations and is intentionally absent from checkpoint state, so the same exact
+checkpoint can resume in either mode.
+
+Cached and recomputed CPU paths produced bit-identical loss and every parameter
+gradient, and the complete 122-test suite passed. With the trainer and both watchdog
+layers stopped, the candidate was measured twice in alternating order on the same
+host and binary:
+
+| Exclusive same-host pair | Recomputed | Cached | Gain |
+| --- | ---: | ---: | ---: |
+| Recomputed then cached | 5,625 tok/s | 6,688 tok/s | 18.9% |
+| Cached then recomputed | 5,745 tok/s | 6,675 tok/s | 16.2% |
+| Combined measured tokens/time | 5,684 tok/s | 6,682 tok/s | 17.6% |
+
+Peak device memory increased from 15.4 GB to 19.0 GB, leaving approximately 14.6 GB
+of headroom. Deterministic benchmark loss remained 9.7488 in every run. The existing
+binary remains on the host as a rollback, and production resumed from the exact
+global/Adam step 5,968 checkpoint with attention caching enabled. The first two
+normal 16-update production logs both reported 6,320 tok/s, with train losses
+4.2523 and 4.4504. That is a 9.6% live gain over the final 5,768 tok/s pre-change
+baseline; the shorter synthetic benchmark overstated the steady production benefit.
+
 ### RTX 5070 Ti promotion benchmark - 2026-08-02
 
 The live trainer was stopped cleanly at global step 4,401, and its complete checkpoint

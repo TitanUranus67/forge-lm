@@ -73,9 +73,11 @@ internal static partial class Cli
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
                         [--backend auto|cpu|gpu|cuda]
                         [--matmul-precision custom|fp32|tf32]
+                        [--cache-attention false]
           llm benchmark [--preset forge-98m|forge-220m|forge-320m]
                         [--backend cuda] [--batch N] [--accum N] [--steps 3]
                         [--vocab 16257] [--ctx N] [--dmodel N] [--layers N] [--heads N]
+                        [--cache-attention false]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
                         [--repetition-penalty 1.0] [--no-repeat-ngram 0]
@@ -283,6 +285,7 @@ internal static partial class Cli
                   --preset forge-98m|forge-220m|forge-320m (default forge-98m)
                   --vocab 16257; architecture flags may override the preset
                   --batch N --accum N --steps 3
+                  --cache-attention true|false (trade spare VRAM for less recomputation)
                 """);
             return 0;
         }
@@ -298,6 +301,7 @@ internal static partial class Cli
         int accumulation = p.GetInt("accum", preset.DefaultAccumulation);
         int steps = p.GetInt("steps", 3);
         int seed = p.GetInt("seed", 42);
+        bool cacheAttention = p.GetBool("cache-attention", false);
         string backendName = p.Get("backend", "cuda");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
         p.Done();
@@ -309,7 +313,8 @@ internal static partial class Cli
         ITensorBackend backend = CreateBackend(backendName, cudaMatMulMode);
         try
         {
-            var model = new GptModel(config, backend, new Random(seed), preset.ModelName);
+            var model = new GptModel(config, backend, new Random(seed), preset.ModelName,
+                cacheAttention);
             long tokensPerUpdate = checked((long)batch * ctx * accumulation);
             long dataTokens = checked(tokensPerUpdate * (steps + 2) + 1);
             if (dataTokens > int.MaxValue)
@@ -337,6 +342,7 @@ internal static partial class Cli
 
             Console.WriteLine($"benchmark: preset {preset.Key}; warmup 1 update; model {model.Params.Count:N0} params; " +
                               $"microbatch {batch} x {ctx}; accum {accumulation}; {tokensPerUpdate:N0} tok/update");
+            Console.WriteLine($"benchmark: attention activations {(cacheAttention ? "cached" : "recomputed")}");
             Trainer.Train(model, data, val: null, Options(1));
             TrainSummary summary = Trainer.Train(model, data, val: null, Options(steps));
             long measuredTokens = checked(tokensPerUpdate * steps);
@@ -381,6 +387,8 @@ internal static partial class Cli
                   --matmul-precision custom keeps the original CUDA kernel; fp32
                   selects strict cuBLAS SGEMM; tf32 explicitly enables NVIDIA TF32
                   math and requires compute capability 8.0 or newer.
+                  --cache-attention true retains Q/K/V and attention probabilities
+                  through backward, trading VRAM for less recomputation.
                   Ctrl+C stops after the current step and still saves.
                   --accum N averages N physical batches before each Adam/LR step.
                   --tokens, --epochs, and --warmup-tokens convert budgets into optimizer
@@ -420,6 +428,7 @@ internal static partial class Cli
         int saveevery = p.GetInt("saveevery", 0);
         string backendName = p.Get("backend", "auto");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
+        bool cacheAttention = p.GetBool("cache-attention", false);
         p.Done();
 
         int budgetFlags = (stepsArg is not null ? 1 : 0) + (tokensArg is not null ? 1 : 0) +
@@ -439,7 +448,8 @@ internal static partial class Cli
         TrainingState? trainState = null;
         if (init is not null)
         {
-            Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(init, backend);
+            Checkpoint.LoadedTrainingCheckpoint loaded = Checkpoint.LoadTraining(init, backend,
+                cacheAttention);
             model = loaded.Model;
             trainState = loaded.TrainingState
                 ?? throw new InvalidDataException("Training checkpoint did not contain resumable state.");
@@ -453,7 +463,8 @@ internal static partial class Cli
         {
             var tok = BpeTokenizer.Load(Path.Combine(dataDir, "tokenizer.json"));
             var config = new ModelConfig(tok.VocabSize, ctx, dmodel, layers, heads);
-            model = new GptModel(config, backend, new Random(seed), modelName);
+            model = new GptModel(config, backend, new Random(seed), modelName,
+                cacheAttention);
             Console.WriteLine($"model: {model.Name} — vocab {config.VocabSize}, ctx {ctx}, dmodel {dmodel}, " +
                               $"layers {layers}, heads {heads}, params {model.Params.Count:N0}");
         }
@@ -487,6 +498,7 @@ internal static partial class Cli
         Console.WriteLine($"training: microbatch {batch} x {model.Config.ContextLength} ctx " +
                           $"({physicalBatchTokens:N0} tokens), accumulation {accumulation} " +
                           $"({tokensPerUpdate:N0} tokens/optimizer update)");
+        Console.WriteLine($"training: attention activations {(cacheAttention ? "cached" : "recomputed")}");
 
         var opts = new TrainOptions
         {

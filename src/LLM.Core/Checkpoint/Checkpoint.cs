@@ -124,8 +124,9 @@ namespace LLM.Core.Checkpoint
         /// <summary>
         /// Loads the complete model and training state.
         /// </summary>
-        public static LoadedTrainingCheckpoint LoadTraining(string path, ITensorBackend backend) =>
-            LoadCore(path, backend, restoreTrainingState: true);
+        public static LoadedTrainingCheckpoint LoadTraining(string path, ITensorBackend backend,
+            bool cacheAttentionActivations = false) =>
+            LoadCore(path, backend, restoreTrainingState: true, cacheAttentionActivations);
 
         private static Header CreateModelHeader(GptModel model) => new()
         {
@@ -171,7 +172,7 @@ namespace LLM.Core.Checkpoint
         }
 
         private static LoadedTrainingCheckpoint LoadCore(string path, ITensorBackend backend,
-            bool restoreTrainingState)
+            bool restoreTrainingState, bool cacheAttentionActivations = false)
         {
             using var fs = OpenCheckpointRead(path);
             byte[] magic = new byte[Magic.Length];
@@ -205,7 +206,8 @@ namespace LLM.Core.Checkpoint
 
             var config = new ModelConfig(header.VocabSize, header.ContextLength,
                 header.DModel, header.NLayers, header.NHeads);
-            var model = new GptModel(config, backend, new Random(0), header.ModelName);
+            var model = new GptModel(config, backend, new Random(0), header.ModelName,
+                cacheAttentionActivations);
             string[] actualNames = model.Params.Names.ToArray();
             if (!header.Names.SequenceEqual(actualNames))
                 throw new InvalidDataException("Checkpoint parameter names do not match the model registry.");
