@@ -10,6 +10,89 @@ using Tensor = LLM.Core.Tensor.Tensor;
 /// <summary>CUDA-specific validation plus the complete device-backend numerical contract.</summary>
 public static class CudaBackendTests
 {
+    [Test]
+    public static void TrainingGraph_MatchesOrdinaryCudaTrajectory()
+    {
+        if (!CudaBackend.IsAvailable) { Console.WriteLine("    skipped (CUDA unavailable)"); return; }
+        var config = new ModelConfig(31, 8, 16, 1, 2);
+        int[] ids = Enumerable.Range(0, 512).Select(i => (i * 7 + 3) % config.VocabSize).ToArray();
+        var options = new TrainOptions
+        {
+            Steps = 3,
+            MaxLr = 2e-4f,
+            MinLr = 2e-4f,
+            WarmupSteps = 0,
+            WeightDecay = 0.1f,
+            GradClip = 1f,
+            ContextLength = config.ContextLength,
+            BatchSize = 2,
+            AccumulationSteps = 3,
+            Seed = 71,
+            LogEvery = 3,
+        };
+
+        Dictionary<string, float[]> expected;
+        float expectedLoss;
+        using (var ordinaryBackend = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasFp32))
+        using (var ordinaryData = new DataLoader(ids))
+        {
+            var ordinary = new GptModel(config, ordinaryBackend, new Random(19));
+            TrainSummary result = Trainer.Train(ordinary, ordinaryData, null, options);
+            expectedLoss = result.FinalTrainLoss;
+            expected = ordinary.Params.Names.ToDictionary(name => name, name =>
+            {
+                Tensor weight = ordinary.Params.Weight(name);
+                ordinaryBackend.EnsureHostCurrent(weight);
+                return (float[])weight.Data.Clone();
+            });
+        }
+
+        using var graphBackend = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasFp32);
+        using var graphData = new DataLoader(ids);
+        var graphModel = new GptModel(config, graphBackend, new Random(19));
+        TrainSummary graphResult = Trainer.Train(graphModel, graphData, null,
+            options with { UseCudaGraphs = true });
+        Check.Near(graphResult.FinalTrainLoss, expectedLoss, 2e-5f,
+            "CUDA graph loss follows ordinary CUDA");
+        foreach (string name in graphModel.Params.Names)
+        {
+            Tensor weight = graphModel.Params.Weight(name);
+            graphBackend.EnsureHostCurrent(weight);
+            Check.SpanNear(weight.Data, expected[name], 2e-5f,
+                $"{name}: CUDA graph update follows ordinary CUDA");
+        }
+    }
+
+    [Test]
+    public static void StreamCapturedGraph_ReplaysKernelSequence()
+    {
+        if (!CudaBackend.IsAvailable) { Console.WriteLine("    skipped (CUDA unavailable)"); return; }
+        using var cuda = new CudaBackend();
+        var x = new Tensor(4); x.Data.AsSpan().Fill(2f);
+        var y = new Tensor(4); y.Data.AsSpan().Fill(3f);
+
+        // Upload before capture so capture contains only replayable device work.
+        cuda.Scale(x, 1f);
+        cuda.Scale(y, 1f);
+        using CudaGraphExecutable graph = cuda.CaptureGraphForTest(() =>
+        {
+            cuda.Scale(x, 2f);
+            cuda.AddInPlace(x, y);
+        });
+
+        graph.Launch();
+        cuda.EnsureHostCurrent(x);
+        Check.SpanNear(x.Data, new float[] { 7f, 7f, 7f, 7f }, 0f,
+            "captured CUDA kernel sequence replays once");
+        // A graph launch bypasses backend tensor bookkeeping. This no-op device write
+        // makes the second replay's result eligible for another host download.
+        cuda.Scale(x, 1f);
+        graph.Launch();
+        cuda.EnsureHostCurrent(x);
+        Check.SpanNear(x.Data, new float[] { 17f, 17f, 17f, 17f }, 0f,
+            "captured CUDA kernel sequence replays repeatedly");
+    }
+
     private static CudaBackend? _cuda;
     private static bool _probed;
 

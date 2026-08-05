@@ -30,6 +30,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         LazyThreadSafetyMode.ExecutionAndPublication);
 
     private readonly CudaAccelerator _accelerator;
+    private readonly CudaStream _stream;
     private readonly CudaMatMulMode _matMulMode;
     private CuBlas? _cuBlas;
     private readonly object _gate = new();
@@ -43,6 +44,16 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
 
     private MemoryBuffer1D<int, Stride1D.Dense>? _indices;
     private int _indicesLength;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _graphInputIndices;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _graphPositionIndices;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _graphTargetIndices;
+    private int _graphIndexLength;
+    private bool _capturingTrainingGraph;
+    private bool _trainingGraphCreated;
+    private int _captureIndexCall;
+    private readonly HashSet<(MemoryBuffer1D<float, Stride1D.Dense> Buffer, int Offset)>
+        _graphReservedChunks = new();
+    private readonly List<Chunk> _graphDetachedFreeChunks = new();
     private MemoryBuffer1D<float, Stride1D.Dense>? _nll;
     private int _nllLength;
     private MemoryBuffer1D<float, Stride1D.Dense>? _lossScalar;
@@ -103,6 +114,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     public CudaBackend(int deviceIndex = 0, CudaMatMulMode matMulMode = CudaMatMulMode.Custom)
     {
         CudaAccelerator? accelerator = null;
+        CudaStream? stream = null;
         CuBlas? cuBlas = null;
         string stage = "CUDA context";
         try
@@ -110,68 +122,70 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             Context context = SharedContext.Value;
             accelerator = context.CreateCudaAccelerator(deviceIndex);
             _accelerator = accelerator;
+            stream = accelerator.CreateStream(StreamFlags.CU_STREAM_NON_BLOCKING);
+            _stream = stream;
             _matMulMode = matMulMode;
 
             stage = nameof(CudaKernels.AddInPlace);
-            _addInPlace = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.BinaryArgs>(CudaKernels.AddInPlace);
+            _addInPlace = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.BinaryArgs>(CudaKernels.AddInPlace));
             stage = nameof(CudaKernels.Copy);
-            _copy = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.BinaryArgs>(CudaKernels.Copy);
+            _copy = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.BinaryArgs>(CudaKernels.Copy));
             stage = nameof(CudaKernels.GeluForward);
-            _geluForward = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.BinaryArgs>(CudaKernels.GeluForward);
+            _geluForward = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.BinaryArgs>(CudaKernels.GeluForward));
             stage = nameof(CudaKernels.CopyBlock);
-            _copyBlock = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.CopyBlockArgs>(CudaKernels.CopyBlock);
+            _copyBlock = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.CopyBlockArgs>(CudaKernels.CopyBlock));
             stage = nameof(CudaKernels.Scale);
-            _scale = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.ScaleArgs>(CudaKernels.Scale);
+            _scale = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.ScaleArgs>(CudaKernels.Scale));
             stage = nameof(CudaKernels.Fill);
-            _fill = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.ScaleArgs>(CudaKernels.Fill);
+            _fill = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.ScaleArgs>(CudaKernels.Fill));
             stage = nameof(CudaKernels.AddBias);
-            _addBias = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.AddBiasArgs>(CudaKernels.AddBias);
+            _addBias = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.AddBiasArgs>(CudaKernels.AddBias));
             stage = nameof(CudaKernels.Transpose);
-            _transpose = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.TransposeArgs>(CudaKernels.Transpose);
+            _transpose = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.TransposeArgs>(CudaKernels.Transpose));
             stage = nameof(CudaKernels.GeluBackward);
-            _geluBackward = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.GeluBackwardArgs>(CudaKernels.GeluBackward);
+            _geluBackward = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.GeluBackwardArgs>(CudaKernels.GeluBackward));
             stage = nameof(CudaKernels.CausalMask);
-            _causalMask = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.CausalMaskArgs>(CudaKernels.CausalMask);
+            _causalMask = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.CausalMaskArgs>(CudaKernels.CausalMask));
             stage = nameof(CudaKernels.PackHeads);
-            _packHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.HeadPackArgs>(CudaKernels.PackHeads);
+            _packHeads = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.HeadPackArgs>(CudaKernels.PackHeads));
             stage = nameof(CudaKernels.UnpackHeads);
-            _unpackHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.HeadPackArgs>(CudaKernels.UnpackHeads);
+            _unpackHeads = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.HeadPackArgs>(CudaKernels.UnpackHeads));
             stage = nameof(CudaKernels.PackQkvHeads);
-            _packQkvHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.QkvHeadPackArgs>(CudaKernels.PackQkvHeads);
+            _packQkvHeads = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.QkvHeadPackArgs>(CudaKernels.PackQkvHeads));
             stage = nameof(CudaKernels.UnpackQkvHeads);
-            _unpackQkvHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.QkvHeadUnpackArgs>(CudaKernels.UnpackQkvHeads);
+            _unpackQkvHeads = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.QkvHeadUnpackArgs>(CudaKernels.UnpackQkvHeads));
             stage = nameof(CudaKernels.SumRows);
-            _sumRows = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.SumRowsArgs>(CudaKernels.SumRows);
+            _sumRows = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.SumRowsArgs>(CudaKernels.SumRows));
             stage = nameof(CudaKernels.LayerNormForward);
-            _layerNormForward = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.LayerNormForwardArgs>(CudaKernels.LayerNormForward);
+            _layerNormForward = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.LayerNormForwardArgs>(CudaKernels.LayerNormForward));
             stage = nameof(CudaKernels.LayerNormBackwardDx);
-            _layerNormBackwardDx = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.LayerNormBackwardDxArgs>(CudaKernels.LayerNormBackwardDx);
+            _layerNormBackwardDx = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.LayerNormBackwardDxArgs>(CudaKernels.LayerNormBackwardDx));
             stage = nameof(CudaKernels.LayerNormBackwardParams);
-            _layerNormBackwardParams = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.LayerNormBackwardParamsArgs>(CudaKernels.LayerNormBackwardParams);
+            _layerNormBackwardParams = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.LayerNormBackwardParamsArgs>(CudaKernels.LayerNormBackwardParams));
             stage = nameof(CudaKernels.SoftmaxForward);
-            _softmaxForward = accelerator.LoadStreamKernel<CudaKernels.UnaryArgs>(CudaKernels.SoftmaxForward);
+            _softmaxForward = Bind(accelerator.LoadKernel<CudaKernels.UnaryArgs>(CudaKernels.SoftmaxForward));
             stage = nameof(CudaKernels.ScaledCausalSoftmaxForward);
-            _scaledCausalSoftmaxForward = accelerator.LoadStreamKernel<CudaKernels.ScaledCausalSoftmaxArgs>(CudaKernels.ScaledCausalSoftmaxForward);
+            _scaledCausalSoftmaxForward = Bind(accelerator.LoadKernel<CudaKernels.ScaledCausalSoftmaxArgs>(CudaKernels.ScaledCausalSoftmaxForward));
             stage = nameof(CudaKernels.SoftmaxBackward);
-            _softmaxBackward = accelerator.LoadStreamKernel<CudaKernels.SoftmaxBackwardArgs>(CudaKernels.SoftmaxBackward);
+            _softmaxBackward = Bind(accelerator.LoadKernel<CudaKernels.SoftmaxBackwardArgs>(CudaKernels.SoftmaxBackward));
             stage = nameof(CudaKernels.EmbeddingForward);
-            _embeddingForward = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.EmbeddingArgs>(CudaKernels.EmbeddingForward);
+            _embeddingForward = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.EmbeddingArgs>(CudaKernels.EmbeddingForward));
             stage = nameof(CudaKernels.EmbeddingBackward);
-            _embeddingBackward = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.EmbeddingArgs>(CudaKernels.EmbeddingBackward);
+            _embeddingBackward = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.EmbeddingArgs>(CudaKernels.EmbeddingBackward));
             stage = nameof(CudaKernels.CrossEntropyForward);
-            _crossEntropyForward = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.CrossEntropyForwardArgs>(CudaKernels.CrossEntropyForward);
+            _crossEntropyForward = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.CrossEntropyForwardArgs>(CudaKernels.CrossEntropyForward));
             stage = nameof(CudaKernels.CrossEntropyBackward);
-            _crossEntropyBackward = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.CrossEntropyBackwardArgs>(CudaKernels.CrossEntropyBackward);
+            _crossEntropyBackward = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.CrossEntropyBackwardArgs>(CudaKernels.CrossEntropyBackward));
             stage = nameof(CudaKernels.MatMul);
-            _matMul = accelerator.LoadStreamKernel<CudaKernels.MatMulArgs>(CudaKernels.MatMul);
+            _matMul = Bind(accelerator.LoadKernel<CudaKernels.MatMulArgs>(CudaKernels.MatMul));
             stage = nameof(CudaKernels.SumSquares);
-            _sumSquares = accelerator.LoadStreamKernel<CudaKernels.SumSquaresArgs>(CudaKernels.SumSquares);
+            _sumSquares = Bind(accelerator.LoadKernel<CudaKernels.SumSquaresArgs>(CudaKernels.SumSquares));
             stage = nameof(CudaKernels.SumSquaresPartials);
-            _sumSquaresPartialsKernel = accelerator.LoadStreamKernel<CudaKernels.SumSquaresPartialsArgs>(CudaKernels.SumSquaresPartials);
+            _sumSquaresPartialsKernel = Bind(accelerator.LoadKernel<CudaKernels.SumSquaresPartialsArgs>(CudaKernels.SumSquaresPartials));
             stage = nameof(CudaKernels.ReduceSum);
-            _reduceSum = accelerator.LoadStreamKernel<CudaKernels.ReduceSumArgs>(CudaKernels.ReduceSum);
+            _reduceSum = Bind(accelerator.LoadKernel<CudaKernels.ReduceSumArgs>(CudaKernels.ReduceSum));
             stage = nameof(CudaKernels.AdamW);
-            _adamW = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.AdamWArgs>(CudaKernels.AdamW);
+            _adamW = Bind(accelerator.LoadAutoGroupedKernel<Index1D, CudaKernels.AdamWArgs>(CudaKernels.AdamW));
 
             if (matMulMode is not CudaMatMulMode.Custom)
             {
@@ -183,7 +197,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
                 stage = "cuBLAS initialization";
                 cuBlas = new CuBlas(accelerator)
                 {
-                    Stream = (CudaStream)accelerator.DefaultStream,
+                    Stream = stream,
                     MathMode = matMulMode is CudaMatMulMode.CuBlasTf32
                         ? Tf32TensorOpMath
                         : CuBlasMathMode.DefaultMath,
@@ -194,10 +208,15 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         catch (Exception ex)
         {
             cuBlas?.Dispose();
+            stream?.Dispose();
             accelerator?.Dispose();
             throw new InvalidOperationException($"CUDA backend initialization failed during {stage}.", ex);
         }
     }
+
+    private Action<TLaunch, TArgs> Bind<TLaunch, TArgs>(
+        Action<AcceleratorStream, TLaunch, TArgs> kernel) =>
+        (launch, args) => kernel(_stream, launch, args);
 
     /// <summary>True when CUDA device zero can be opened by ILGPU.</summary>
     public static bool IsAvailable
@@ -250,6 +269,131 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         get { lock (_gate) return _fusedAttentionCalls; }
     }
 
+    internal CudaGraphExecutable CaptureGraphForTest(Action body)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        lock (_gate)
+        {
+            _stream.Synchronize();
+            CudaGraphNative.BeginCapture(_stream);
+            try
+            {
+                body();
+                return new CudaGraphExecutable(_stream,
+                    CudaGraphNative.EndCaptureAndInstantiate(_stream));
+            }
+            catch
+            {
+                CudaGraphNative.AbortCapture(_stream);
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Captures one already-warmed forward/backward pass. Changing token and target
+    /// IDs are staged into stable device buffers before every replay, while all model
+    /// operations retain the addresses recorded by the CUDA graph.
+    /// </summary>
+    internal CudaTrainingGraph CaptureTrainingGraph(Action body, int tokenCount, int batch)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        if (tokenCount < 1 || batch < 1 || tokenCount % batch != 0)
+            throw new ArgumentException("A CUDA training graph requires a positive, evenly batched token count.");
+
+        lock (_gate)
+        {
+            if (_trainingGraphCreated)
+                throw new InvalidOperationException("This CUDA backend already owns a training graph.");
+
+            int sequenceLength = tokenCount / batch;
+            if (_graphInputIndices is null || _graphIndexLength != tokenCount)
+            {
+                _stream.Synchronize();
+                _graphInputIndices?.Dispose();
+                _graphPositionIndices?.Dispose();
+                _graphTargetIndices?.Dispose();
+                _graphInputIndices = _accelerator.Allocate1D<int>(tokenCount);
+                _graphPositionIndices = _accelerator.Allocate1D<int>(tokenCount);
+                _graphTargetIndices = _accelerator.Allocate1D<int>(tokenCount);
+            }
+            _graphIndexLength = tokenCount;
+            var positions = new int[tokenCount];
+            for (int b = 0; b < batch; b++)
+                for (int t = 0; t < sequenceLength; t++)
+                    positions[b * sequenceLength + t] = t;
+            _graphPositionIndices!.View.CopyFromCPU(_stream, positions);
+
+            _stream.Synchronize();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+            ReclaimDeadEntries();
+            _captureIndexCall = 0;
+            _capturingTrainingGraph = true;
+            bool captureEnded = false;
+            CudaGraphExecutable? executable = null;
+            try
+            {
+                CudaGraphNative.BeginCapture(_stream);
+                body();
+                if (_captureIndexCall != 6)
+                    throw new InvalidOperationException(
+                        $"Expected six model index uses while capturing training, observed {_captureIndexCall}.");
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+                ReclaimDeadEntries();
+                RemoveGraphReservedChunksFromFreeLists();
+                executable = new CudaGraphExecutable(_stream,
+                    CudaGraphNative.EndCaptureAndInstantiate(_stream));
+                captureEnded = true;
+                _trainingGraphCreated = true;
+                return new CudaTrainingGraph(this, executable, tokenCount);
+            }
+            catch
+            {
+                executable?.Dispose();
+                if (!captureEnded) CudaGraphNative.AbortCapture(_stream);
+                _graphReservedChunks.Clear();
+                RestoreGraphDetachedFreeChunks();
+                throw;
+            }
+            finally
+            {
+                _capturingTrainingGraph = false;
+            }
+        }
+    }
+
+    internal void ReplayTrainingGraph(CudaGraphExecutable executable, int[] inputs, int[] targets,
+        int expectedTokenCount)
+    {
+        ArgumentNullException.ThrowIfNull(inputs);
+        ArgumentNullException.ThrowIfNull(targets);
+        lock (_gate)
+        {
+            if (!_trainingGraphCreated || inputs.Length != expectedTokenCount || targets.Length != expectedTokenCount)
+                throw new ArgumentException("CUDA graph inputs must match the captured physical batch shape.");
+            if (!_accumulatingLoss)
+                throw new InvalidOperationException("CUDA training graph replay requires active loss accumulation.");
+
+            _graphInputIndices!.View.CopyFromCPU(_stream, inputs);
+            _graphTargetIndices!.View.CopyFromCPU(_stream, targets);
+            executable.Launch();
+            for (int i = 0; i < targets.Length; i++)
+                if (targets[i] != -1) _accumulatedTargets++;
+        }
+    }
+
+    internal void ReleaseTrainingGraph(CudaGraphExecutable executable)
+    {
+        lock (_gate)
+        {
+            _stream.Synchronize();
+            executable.Dispose();
+            _trainingGraphCreated = false;
+            _graphReservedChunks.Clear();
+            RestoreGraphDetachedFreeChunks();
+        }
+    }
+
     internal static int BucketOf(int length)
     {
         if (length <= 1024) return (length + 15) & ~15;
@@ -289,9 +433,38 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
 
     private void PushFree(Chunk chunk)
     {
+        // Reuse within the capture itself is safe: all commands are ordered on one
+        // stream, and the resulting graph records that same lifetime aliasing. Once
+        // capture ends, every address referenced by the executable stays reserved.
+        if (!_capturingTrainingGraph &&
+            _graphReservedChunks.Contains((chunk.Buffer!, chunk.Offset))) return;
         if (!_freeChunks.TryGetValue(chunk.Length, out Stack<Chunk>? stack))
             _freeChunks[chunk.Length] = stack = new Stack<Chunk>();
         stack.Push(chunk);
+    }
+
+    private void RemoveGraphReservedChunksFromFreeLists()
+    {
+        foreach (Stack<Chunk> stack in _freeChunks.Values)
+        {
+            if (stack.Count == 0) continue;
+            Chunk[] chunks = stack.ToArray();
+            stack.Clear();
+            for (int i = chunks.Length - 1; i >= 0; i--)
+            {
+                Chunk chunk = chunks[i];
+                if (_graphReservedChunks.Contains((chunk.Buffer!, chunk.Offset)))
+                    _graphDetachedFreeChunks.Add(chunk);
+                else
+                    stack.Push(chunk);
+            }
+        }
+    }
+
+    private void RestoreGraphDetachedFreeChunks()
+    {
+        foreach (Chunk chunk in _graphDetachedFreeChunks) PushFree(chunk);
+        _graphDetachedFreeChunks.Clear();
     }
 
     private Chunk Carve(int bucket)
@@ -348,10 +521,12 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         Entry entry = GetEntry(tensor);
         if (!entry.DeviceCurrent)
         {
-            View(entry.Storage, tensor.Length).CopyFromCPU(tensor.Data);
+            View(entry.Storage, tensor.Length).CopyFromCPU(_stream, tensor.Data);
             entry.DeviceCurrent = true;
             entry.HostStale = false;
         }
+        if (_capturingTrainingGraph)
+            _graphReservedChunks.Add((entry.Storage.Buffer!, entry.Storage.Offset));
         return entry.Storage;
     }
 
@@ -359,23 +534,38 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     {
         Entry entry = GetEntry(tensor);
         if (readModifyWrite && !entry.DeviceCurrent)
-            View(entry.Storage, tensor.Length).CopyFromCPU(tensor.Data);
+            View(entry.Storage, tensor.Length).CopyFromCPU(_stream, tensor.Data);
         entry.DeviceCurrent = true;
         entry.HostStale = true;
+        if (_capturingTrainingGraph)
+            _graphReservedChunks.Add((entry.Storage.Buffer!, entry.Storage.Offset));
         return entry.Storage;
     }
 
     private ArrayView<int> CopyIndices(int[] indices)
     {
+        if (_capturingTrainingGraph)
+        {
+            if (indices.Length != _graphIndexLength)
+                throw new InvalidOperationException(
+                    $"Captured index length {indices.Length} does not match {_graphIndexLength}.");
+            return _captureIndexCall++ switch
+            {
+                0 or 5 => _graphInputIndices!.View,
+                1 or 4 => _graphPositionIndices!.View,
+                2 or 3 => _graphTargetIndices!.View,
+                _ => throw new InvalidOperationException("Unexpected model index use during CUDA graph capture."),
+            };
+        }
         if (_indices is null || _indicesLength < indices.Length)
         {
-            _accelerator.Synchronize();
+            _stream.Synchronize();
             _indices?.Dispose();
             _indices = _accelerator.Allocate1D<int>(indices.Length);
             _indicesLength = indices.Length;
         }
         ArrayView<int> view = _indices.View.SubView(0, indices.Length);
-        view.CopyFromCPU(indices);
+        view.CopyFromCPU(_stream, indices);
         return view;
     }
 
@@ -383,7 +573,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     {
         if (_nll is null || _nllLength < length)
         {
-            _accelerator.Synchronize();
+            _stream.Synchronize();
             _nll?.Dispose();
             _nll = _accelerator.Allocate1D<float>(length);
             _nllLength = length;
@@ -402,7 +592,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         lock (_gate)
         {
             if (t.DeviceResource is not Entry e || !e.HostStale || e.Storage.Buffer is null) return;
-            View(e.Storage, t.Length).CopyToCPU(t.Data);
+            View(e.Storage, t.Length).CopyToCPU(_stream, t.Data);
             e.HostStale = false;
         }
     }
@@ -425,7 +615,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             Chunk x = Read(t);
             _scalar ??= _accelerator.Allocate1D<float>(1);
             _sumSquares((1, 256), new CudaKernels.SumSquaresArgs(View(x, t.Length), _scalar.View, t.Length));
-            _scalar.View.CopyToCPU(_scalarHost);
+            _scalar.View.CopyToCPU(_stream, _scalarHost);
             _reductionReadbacks++;
             return _scalarHost[0];
         }
@@ -443,7 +633,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
 
             if (_sumSquaresPartials is null || _sumSquaresPartialsLength < partialCount)
             {
-                _accelerator.Synchronize();
+                _stream.Synchronize();
                 _sumSquaresPartials?.Dispose();
                 _sumSquaresPartials = _accelerator.Allocate1D<float>(partialCount);
                 _sumSquaresPartialsLength = partialCount;
@@ -463,7 +653,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
 
             _reduceSum((1, 256), new CudaKernels.ReduceSumArgs(
                 _sumSquaresPartials.View.SubView(0, partialCount), _scalar.View, partialCount));
-            _scalar.View.CopyToCPU(_scalarHost);
+            _scalar.View.CopyToCPU(_stream, _scalarHost);
             _reductionReadbacks++;
             return _scalarHost[0];
         }
@@ -818,11 +1008,11 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
                 _accumulatingLoss ? 1 : 0));
             if (_accumulatingLoss)
             {
-                _accumulatedTargets += count;
+                if (!_capturingTrainingGraph) _accumulatedTargets += count;
                 return 0f;
             }
             float[] perRow = new float[T];
-            nll.CopyToCPU(perRow);
+            nll.CopyToCPU(_stream, perRow);
             double total = 0;
             for (int t = 0; t < T; t++)
                 if (targets[t] != ignoreIndex) total += perRow[t];
@@ -837,7 +1027,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             if (_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is already active.");
             _lossScalar ??= _accelerator.Allocate1D<float>(1);
             _scalarHost[0] = 0f;
-            _lossScalar.CopyFromCPU(_scalarHost);
+            _lossScalar.CopyFromCPU(_stream, _scalarHost);
             _accumulatedTargets = 0;
             _accumulatingLoss = true;
         }
@@ -848,7 +1038,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         lock (_gate)
         {
             if (!_accumulatingLoss) throw new InvalidOperationException("Loss accumulation is not active.");
-            _lossScalar!.CopyToCPU(_scalarHost);
+            _lossScalar!.CopyToCPU(_stream, _scalarHost);
             _accumulatingLoss = false;
             _reductionReadbacks++;
             return _accumulatedTargets == 0 ? 0f : _scalarHost[0] / _accumulatedTargets;
@@ -880,21 +1070,24 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            _accelerator.Synchronize();
+            _stream.Synchronize();
             _cuBlas?.Dispose(); _cuBlas = null;
-            _indices?.Dispose(); _nll?.Dispose(); _lossScalar?.Dispose(); _scalar?.Dispose(); _sumSquaresPartials?.Dispose();
+            _indices?.Dispose(); _graphInputIndices?.Dispose(); _graphPositionIndices?.Dispose();
+            _graphTargetIndices?.Dispose(); _nll?.Dispose(); _lossScalar?.Dispose(); _scalar?.Dispose();
+            _sumSquaresPartials?.Dispose();
             foreach ((WeakReference<TensorValue> owner, Entry entry) in _entries)
             {
                 if (owner.TryGetTarget(out TensorValue? tensor) && ReferenceEquals(tensor.DeviceResource, entry))
                 {
                     if (entry.HostStale && entry.Storage.Buffer is not null)
-                        View(entry.Storage, tensor.Length).CopyToCPU(tensor.Data);
+                        View(entry.Storage, tensor.Length).CopyToCPU(_stream, tensor.Data);
                     tensor.DeviceResource = null;
                 }
                 entry.Storage = default;
             }
             foreach (MemoryBuffer1D<float, Stride1D.Dense> buffer in _deviceBuffers) buffer.Dispose();
             _deviceBuffers.Clear(); _freeChunks.Clear(); _entries.Clear(); _arena = null;
+            _stream.Dispose();
             _accelerator.Dispose();
         }
     }

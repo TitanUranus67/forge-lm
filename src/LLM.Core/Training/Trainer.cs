@@ -3,6 +3,7 @@ namespace LLM.Core.Training
     using System.Diagnostics;
     using LLM.Core.Model;
     using LLM.Core.Tensor;
+    using LLM.Core.Tensor.Cuda;
 
     /// <summary>Hyperparameters for one <see cref="Trainer.Train"/> run.</summary>
     public sealed record TrainOptions
@@ -37,6 +38,8 @@ namespace LLM.Core.Training
         public int ValSeed { get; init; } = 424242;
         /// <summary>Invoke the save callback every this many steps; 0 disables it.</summary>
         public int SaveEvery { get; init; } = 0;
+        /// <summary>Replay the CUDA forward/backward microbatch as a captured graph.</summary>
+        public bool UseCudaGraphs { get; init; }
     }
 
     /// <summary>One progress record emitted to the Train callback.</summary>
@@ -120,6 +123,8 @@ namespace LLM.Core.Training
             AdamW adam = state.Optimizer;
             int[] inputs = new int[batch * ctx], targets = new int[batch * ctx];
             int[] seqInputs = new int[ctx], seqTargets = new int[ctx];
+            using CudaTrainingGraph? trainingGraph = PrepareCudaTrainingGraph(
+                model, opts, inputs, targets, batch, accumulation);
             var sw = Stopwatch.StartNew();
             bool prof = Environment.GetEnvironmentVariable("LLM_GPU_STATS") == "1";
 
@@ -143,7 +148,10 @@ namespace LLM.Core.Training
                         Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
                         Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
                     }
-                    model.ForwardBackward(inputs, targets, batch, microbatchGradientScale);
+                    if (trainingGraph is null)
+                        model.ForwardBackward(inputs, targets, batch, microbatchGradientScale);
+                    else
+                        trainingGraph.Replay(inputs, targets);
                 }
                 lastTrain = model.Backend.EndLossAccumulation();
                 long p2 = prof ? Stopwatch.GetTimestamp() : 0;
@@ -181,6 +189,29 @@ namespace LLM.Core.Training
             }
             sw.Stop();
             return new TrainSummary(lastTrain, float.IsNaN(lastVal) ? null : lastVal, stepsRun, sw.Elapsed);
+        }
+
+        private static CudaTrainingGraph? PrepareCudaTrainingGraph(GptModel model, TrainOptions opts,
+            int[] inputs, int[] targets, int batch, int accumulation)
+        {
+            if (!opts.UseCudaGraphs) return null;
+            if (model.Backend is not CudaBackend cuda)
+                throw new ArgumentException("CUDA graph replay requires the CUDA backend.", nameof(opts));
+
+            float gradientScale = 1f / accumulation;
+            model.Params.ZeroGrads();
+            model.Backend.BeginLossAccumulation();
+            model.ForwardBackward(inputs, targets, batch, gradientScale);
+            _ = model.Backend.EndLossAccumulation();
+
+            model.Params.ZeroGrads();
+            model.Backend.BeginLossAccumulation();
+            CudaTrainingGraph graph = cuda.CaptureTrainingGraph(
+                () => model.ForwardBackward(inputs, targets, batch, gradientScale),
+                inputs.Length, batch);
+            _ = model.Backend.EndLossAccumulation();
+            model.Params.ZeroGrads();
+            return graph;
         }
 
         /// <summary>

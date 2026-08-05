@@ -74,10 +74,12 @@ internal static partial class Cli
                         [--backend auto|cpu|gpu|cuda]
                         [--matmul-precision custom|fp32|tf32]
                         [--cache-attention false]
+                        [--cuda-graphs false]
           llm benchmark [--preset forge-98m|forge-220m|forge-320m]
                         [--backend cuda] [--batch N] [--accum N] [--steps 3]
                         [--vocab 16257] [--ctx N] [--dmodel N] [--layers N] [--heads N]
                         [--cache-attention false]
+                        [--cuda-graphs false]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
                         [--repetition-penalty 1.0] [--no-repeat-ngram 0]
@@ -286,6 +288,7 @@ internal static partial class Cli
                   --vocab 16257; architecture flags may override the preset
                   --batch N --accum N --steps 3
                   --cache-attention true|false (trade spare VRAM for less recomputation)
+                  --cuda-graphs true|false (capture and replay CUDA forward/backward)
                 """);
             return 0;
         }
@@ -302,6 +305,7 @@ internal static partial class Cli
         int steps = p.GetInt("steps", 3);
         int seed = p.GetInt("seed", 42);
         bool cacheAttention = p.GetBool("cache-attention", false);
+        bool cudaGraphs = p.GetBool("cuda-graphs", false);
         string backendName = p.Get("backend", "cuda");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
         p.Done();
@@ -338,11 +342,13 @@ internal static partial class Cli
                 Seed = seed,
                 LogEvery = measuredSteps,
                 ValEvery = 0,
+                UseCudaGraphs = cudaGraphs,
             };
 
             Console.WriteLine($"benchmark: preset {preset.Key}; warmup 1 update; model {model.Params.Count:N0} params; " +
                               $"microbatch {batch} x {ctx}; accum {accumulation}; {tokensPerUpdate:N0} tok/update");
             Console.WriteLine($"benchmark: attention activations {(cacheAttention ? "cached" : "recomputed")}");
+            Console.WriteLine($"benchmark: CUDA graphs {(cudaGraphs ? "enabled" : "disabled")}");
             Trainer.Train(model, data, val: null, Options(1));
             TrainSummary summary = Trainer.Train(model, data, val: null, Options(steps));
             long measuredTokens = checked(tokensPerUpdate * steps);
@@ -389,6 +395,8 @@ internal static partial class Cli
                   math and requires compute capability 8.0 or newer.
                   --cache-attention true retains Q/K/V and attention probabilities
                   through backward, trading VRAM for less recomputation.
+                  --cuda-graphs true captures one warmed CUDA forward/backward pass
+                  and replays it with newly staged token and target IDs.
                   Ctrl+C stops after the current step and still saves.
                   --accum N averages N physical batches before each Adam/LR step.
                   --tokens, --epochs, and --warmup-tokens convert budgets into optimizer
@@ -429,6 +437,7 @@ internal static partial class Cli
         string backendName = p.Get("backend", "auto");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
         bool cacheAttention = p.GetBool("cache-attention", false);
+        bool cudaGraphs = p.GetBool("cuda-graphs", false);
         p.Done();
 
         int budgetFlags = (stepsArg is not null ? 1 : 0) + (tokensArg is not null ? 1 : 0) +
@@ -499,6 +508,7 @@ internal static partial class Cli
                           $"({physicalBatchTokens:N0} tokens), accumulation {accumulation} " +
                           $"({tokensPerUpdate:N0} tokens/optimizer update)");
         Console.WriteLine($"training: attention activations {(cacheAttention ? "cached" : "recomputed")}");
+        Console.WriteLine($"training: CUDA graphs {(cudaGraphs ? "enabled" : "disabled")}");
 
         var opts = new TrainOptions
         {
@@ -517,6 +527,7 @@ internal static partial class Cli
             ValBatches = valbatches,
             ValSeed = valseed,
             SaveEvery = saveevery,
+            UseCudaGraphs = cudaGraphs,
         };
 
         Console.WriteLine("data identity: hashing tokenizer.json, train.bin, and val.bin...");
