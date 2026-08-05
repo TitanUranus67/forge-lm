@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using LLM.Core.Checkpoint;
@@ -529,15 +530,27 @@ internal static partial class Cli
 
         // Ctrl+C cancels after the current step; the checkpoint below is still written
         using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (s, e) =>
+        void RequestShutdown()
         {
-            e.Cancel = true;
             if (!cts.IsCancellationRequested)
             {
                 Console.WriteLine("\ninterrupt: finishing current step, then saving...");
                 cts.Cancel();
             }
+        }
+
+        Console.CancelKeyPress += (s, e) =>
+        {
+            e.Cancel = true;
+            RequestShutdown();
         };
+        using PosixSignalRegistration? terminateRegistration = OperatingSystem.IsWindows()
+            ? null
+            : PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+            {
+                context.Cancel = true;
+                RequestShutdown();
+            });
 
         // polled once per step by the trainer; 'p' pauses, then r/s/q resumes/saves/quits.
         // KeyAvailable throws when stdin is redirected, so guard with IsInputRedirected.

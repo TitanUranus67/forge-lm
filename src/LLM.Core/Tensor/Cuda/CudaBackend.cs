@@ -53,6 +53,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     private int _sumSquaresPartialsLength;
     private readonly float[] _scalarHost = new float[1];
     private long _reductionReadbacks;
+    private long _stridedBatchedMatMulCalls;
 
     private readonly Action<Index1D, CudaKernels.BinaryArgs> _addInPlace, _copy, _geluForward;
     private readonly Action<Index1D, CudaKernels.CopyBlockArgs> _copyBlock;
@@ -227,6 +228,11 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     internal long ReductionReadbackCount
     {
         get { lock (_gate) return _reductionReadbacks; }
+    }
+
+    internal long StridedBatchedMatMulCallCount
+    {
+        get { lock (_gate) return _stridedBatchedMatMulCalls; }
     }
 
     internal static int BucketOf(int length)
@@ -519,14 +525,24 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         int yStride = m * n;
         float beta = accumulate ? 1f : 0f;
 
-        for (int slot = 0; slot < slots; slot++)
+        if (slots > 1)
         {
-            // Arguments are deliberately reversed: row-major C is column-major C^T.
-            _cuBlas!.Gemm(opB, opA, n, m, k, 1f,
-                bView.SubView(slot * bStride, bStride), ldb,
-                aView.SubView(slot * aStride, aStride), lda,
-                beta, yView.SubView(slot * yStride, yStride), n);
+            CuBlas cuBlas = _cuBlas!;
+            cuBlas.PointerMode = CuBlasPointerMode.Host;
+            CuBlasStatus status = CuBlasNative.SgemmStridedBatchedCall(
+                cuBlas.Handle, opB, opA, n, m, k, 1f,
+                bView.LoadEffectiveAddressAsPtr(), ldb, bStride,
+                aView.LoadEffectiveAddressAsPtr(), lda, aStride,
+                beta, yView.LoadEffectiveAddressAsPtr(), n, yStride, slots);
+            if (status != CuBlasStatus.CUBLAS_STATUS_SUCCESS)
+                throw new CuBlasException(status);
+            _stridedBatchedMatMulCalls++;
+            return;
         }
+
+        // Arguments are deliberately reversed: row-major C is column-major C^T.
+        _cuBlas!.Gemm(opB, opA, n, m, k, 1f,
+            bView, ldb, aView, lda, beta, yView, n);
     }
 
     public void MatMulNN(TensorValue a, TensorValue b, TensorValue y, int M, int K, int N, bool accumulate = false)

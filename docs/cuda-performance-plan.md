@@ -2,9 +2,10 @@
 
 **Status: the first cloud run is complete and its instance is gone. Device-side
 loss accumulation and the one-readback CUDA global gradient norm are in Forge.
-cuBLAS FP32 and TF32 remain selectable but were not faster on the tested RTX 5070 Ti.
-The next required gate is a physical-batch sweep on the exact GPU rented for the
-fresh Forge run.**
+cuBLAS FP32 and TF32 remain selectable. The first cuBLAS implementation was not
+faster on the tested RTX 5070 Ti because its attention path submitted one GEMM per
+batch/head slot. True strided-batched cuBLAS attention was promoted on the Forge-220M
+RTX 5090 run after numerical and same-host performance gates.**
 
 ## Goal
 
@@ -45,6 +46,51 @@ capability gating.
 The remaining queued improvements are recorded below: cloud-GPU batch sizing,
 remaining launch fusion, data prefetch, validation/checkpoint timing, and BF16 only
 as a separately designed project.
+
+### RTX 5090 strided-batched attention promotion - 2026-08-05
+
+Live profiling of Forge-220M showed one host thread saturated while GPU utilization
+oscillated between 7% and 82%. The cuBLAS path's nominally batched operation was a
+host loop over all `batch * heads` slots. At batch 4, 16 heads, 16 layers, and 8
+accumulation passes, the seven forward/backward attention matmuls submitted 57,344
+individual GEMMs per optimizer update.
+
+ILGPU 1.5 does not expose `cublasSgemmStridedBatched`, so Forge now has a narrow
+native binding for that one operation. It reuses ILGPU's cuBLAS handle, stream,
+device-resident allocations, pointer mode, and math mode. Single-matrix projections
+continue through ILGPU's ordinary GEMM wrapper.
+
+The complete 121-test suite passed on an RTX 2080, including NN/NT/TN batched
+matmuls with and without accumulation, full-model gradients, overfit, allocation,
+checkpoint-resume, and CPU comparisons. The Linux candidate then produced matching
+loss on the production RTX 5090:
+
+| Same-host Forge-220M benchmark | Old slot loop | Strided batch | Gain |
+| --- | ---: | ---: | ---: |
+| 5 measured updates | 4,717 tok/s | 5,332 tok/s | 13.0% |
+| 10 measured updates, reverse order | 5,080 tok/s | 5,409 tok/s | 6.5% |
+| Combined measured tokens/time | 4,953 tok/s | 5,383 tok/s | 8.7% |
+
+The production trainer was checkpointed at global/Adam step 5,439, the old binary
+was retained on the instance as a rollback, and training resumed from the exact
+checkpoint with the promoted binary. A stale completion watchdog then destroyed
+that instance after mistaking the clean benchmark stop for the end of training.
+The verified checkpoint was recovered locally before destruction and resumed at
+step 5,439; the first update and fixed validation produced loss 4.3708 / val 4.3263
+and atomically saved a new step-5,440 checkpoint.
+
+The first replacement 5090 host was rejected after a clean 16-update interval ran
+at only 2,064 tok/s. The same published binary and production shape benchmarked at
+5,639 tok/s on a Ryzen 9 9950X3D / RTX 5090 host, 2.73x faster and slightly cheaper.
+This host-level benchmark is now a required recovery gate: matching the GPU name is
+not sufficient when the training loop is sensitive to host submission latency.
+After the signal-handling gate advanced and atomically saved step 5,442, production
+resumed on that host and reached step 5,456 at 5,385 tok/s with loss 4.3280.
+
+Remote shutdown also now registers SIGTERM through .NET's POSIX signal API. The
+background launcher inherits SIGINT as ignored under `nohup`, so SIGTERM is the
+reliable automation path for finishing the current optimizer update and publishing
+an atomic checkpoint.
 
 ### RTX 5070 Ti promotion benchmark - 2026-08-02
 

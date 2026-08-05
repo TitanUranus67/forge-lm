@@ -92,6 +92,7 @@ public static class CudaBackendTests
         if (Skip()) return;
         using var cuda = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasFp32);
         Check.True(cuda.MatMulMode == CudaMatMulMode.CuBlasFp32, "cuBLAS FP32 mode is active");
+        long batchedCallsBefore = cuda.StridedBatchedMatMulCallCount;
         GpuBackendTests.RunWithBackend(cuda, () =>
         {
             GpuBackendTests.MatMul_MatchesCpu();
@@ -100,6 +101,8 @@ public static class CudaBackendTests
             GpuBackendTests.Model_GradientCheck_Batched();
             GpuBackendTests.Overfit_SmallBatchLossDrops();
         });
+        Check.True(cuda.StridedBatchedMatMulCallCount > batchedCallsBefore,
+            "cuBLAS attention uses strided-batched GEMM");
     }
 
     [Test]
