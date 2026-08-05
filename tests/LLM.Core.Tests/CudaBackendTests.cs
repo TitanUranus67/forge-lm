@@ -93,6 +93,7 @@ public static class CudaBackendTests
         using var cuda = new CudaBackend(matMulMode: CudaMatMulMode.CuBlasFp32);
         Check.True(cuda.MatMulMode == CudaMatMulMode.CuBlasFp32, "cuBLAS FP32 mode is active");
         long batchedCallsBefore = cuda.StridedBatchedMatMulCallCount;
+        long fusedAttentionCallsBefore = cuda.FusedAttentionCallCount;
         GpuBackendTests.RunWithBackend(cuda, () =>
         {
             GpuBackendTests.MatMul_MatchesCpu();
@@ -103,6 +104,8 @@ public static class CudaBackendTests
         });
         Check.True(cuda.StridedBatchedMatMulCallCount > batchedCallsBefore,
             "cuBLAS attention uses strided-batched GEMM");
+        Check.True(cuda.FusedAttentionCallCount > fusedAttentionCallsBefore,
+            "CUDA attention uses fused packing and softmax kernels");
     }
 
     [Test]

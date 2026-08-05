@@ -92,6 +92,38 @@ background launcher inherits SIGINT as ignored under `nohup`, so SIGTERM is the
 reliable automation path for finishing the current optimizer update and publishing
 an atomic checkpoint.
 
+### RTX 5090 attention housekeeping fusion - 2026-08-05
+
+Increasing the physical batch was tested first on the same Ryzen 9 9950X3D / RTX
+5090 host. Batch 8 with accumulation 4 preserved 32,768 tokens/update but used about
+26.5 GB instead of 15.5 GB and reached 5,088 tok/s, versus 5,384 tok/s for batch 4
+with accumulation 8 in the reverse control. The larger physical batch was therefore
+rejected; it was 5.5% slower despite using substantially more VRAM.
+
+The next candidate fused attention's Q/K/V head packing, Q/K/V gradient unpacking,
+scale-plus-causal-mask-plus-softmax, and scaled softmax backward operations. At the
+Forge-220M production geometry this removes approximately 1,408 small CUDA launches
+per optimizer update without changing model, optimizer, sampler, or checkpoint
+semantics. The complete 121-test suite passed, including CPU-composed comparisons
+for every fused helper, CUDA model/gradient agreement, overfit, allocation, and
+checkpoint tests.
+
+The first A/B attempt was discarded after discovering that the remote watchdog had
+restarted production during the measurements. After stopping both the outer
+watchdog and trainer and verifying an idle GPU, two alternating ten-update pairs
+produced matching deterministic loss:
+
+| Exclusive same-host pair | Existing binary | Fused attention | Gain |
+| --- | ---: | ---: | ---: |
+| Baseline then candidate | 5,373 tok/s | 5,430 tok/s | 1.1% |
+| Candidate then baseline | 5,361 tok/s | 5,451 tok/s | 1.7% |
+| Combined measured tokens/time | 5,367 tok/s | 5,441 tok/s | 1.4% |
+
+The gain is modest but repeated in both orders. The old binary remains on the host
+as a rollback, and production resumed from the exact global/Adam step 5,840
+checkpoint with the fused binary. Its first two normal 16-update production logs
+reached 5,563 and 5,690 tok/s with train losses 4.2524 and 4.3407.
+
 ### RTX 5070 Ti promotion benchmark - 2026-08-02
 
 The live trainer was stopped cleanly at global step 4,401, and its complete checkpoint

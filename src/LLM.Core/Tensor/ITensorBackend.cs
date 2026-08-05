@@ -54,6 +54,27 @@ public interface ITensorBackend
     /// </summary>
     void UnpackHeads(Tensor src, Tensor dst, int batch, int T, int nHeads, int headDim, int colBase);
 
+    /// <summary>Packs the three contiguous Q/K/V blocks from src:[B*T,3*D] in one logical operation.</summary>
+    void PackQkvHeads(Tensor src, Tensor q, Tensor k, Tensor v,
+        int batch, int T, int nHeads, int headDim)
+    {
+        int dModel = nHeads * headDim;
+        PackHeads(src, q, batch, T, nHeads, headDim, 0);
+        PackHeads(src, k, batch, T, nHeads, headDim, dModel);
+        PackHeads(src, v, batch, T, nHeads, headDim, 2 * dModel);
+    }
+
+    /// <summary>Writes packed dQ/dK/dV into the three contiguous blocks of dst:[B*T,3*D].</summary>
+    void UnpackQkvHeads(Tensor q, Tensor k, Tensor v, Tensor dst,
+        int batch, int T, int nHeads, int headDim)
+    {
+        int dModel = nHeads * headDim;
+        Zero(dst);
+        UnpackHeads(q, dst, batch, T, nHeads, headDim, 0);
+        UnpackHeads(k, dst, batch, T, nHeads, headDim, dModel);
+        UnpackHeads(v, dst, batch, T, nHeads, headDim, 2 * dModel);
+    }
+
     // ---- Elementwise / rows -------------------------------------------------
     /// <summary>y[r,c] += bias[c] for every row r. y:[rows,cols], bias:[cols]</summary>
     void AddBias(Tensor y, Tensor bias, int rows, int cols);
@@ -91,6 +112,22 @@ public interface ITensorBackend
     void SoftmaxForward(Tensor x, int rows, int cols);
     /// <summary>dX = s * (dOut - sum(dOut*s)) row-wise; s = softmax output. All [rows,cols].</summary>
     void SoftmaxBackward(Tensor dOut, Tensor softmaxOut, Tensor dX, int rows, int cols);
+
+    /// <summary>In-place scale, causal mask, and row-wise softmax for packed T-by-T attention scores.</summary>
+    void ScaledCausalSoftmaxForward(Tensor scores, int rows, int T, float scale)
+    {
+        Scale(scores, scale);
+        CausalMask(scores, T);
+        SoftmaxForward(scores, rows, T);
+    }
+
+    /// <summary>Softmax backward with its output multiplied by the attention scale.</summary>
+    void ScaledSoftmaxBackward(Tensor dOut, Tensor softmaxOut, Tensor dX,
+        int rows, int cols, float scale)
+    {
+        SoftmaxBackward(dOut, softmaxOut, dX, rows, cols);
+        Scale(dX, scale);
+    }
 
     // ---- GELU ------------------------------------------------------------------
     /// <summary>Tanh-approximation GELU, elementwise.</summary>

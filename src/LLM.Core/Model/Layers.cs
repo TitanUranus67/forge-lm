@@ -201,15 +201,11 @@ namespace LLM.Core.Model
             var q = new Tensor(slots * t, hd);
             var k = new Tensor(slots * t, hd);
             var v = new Tensor(slots * t, hd);
-            _b.PackHeads(qkv, q, batch, t, _nHeads, hd, 0);
-            _b.PackHeads(qkv, k, batch, t, _nHeads, hd, _dModel);
-            _b.PackHeads(qkv, v, batch, t, _nHeads, hd, 2 * _dModel);
+            _b.PackQkvHeads(qkv, q, k, v, batch, t, _nHeads, hd);
 
             var probs = new Tensor(slots * t, t); // scores -> softmax in place
             _b.BatchedMatMulNT(q, k, probs, slots, t, hd, t);
-            _b.Scale(probs, _invScale);
-            _b.CausalMask(probs, t);
-            _b.SoftmaxForward(probs, slots * t, t);
+            _b.ScaledCausalSoftmaxForward(probs, slots * t, t, _invScale);
 
             var ctx = new Tensor(slots * t, hd);
             _b.BatchedMatMulNN(probs, v, ctx, slots, t, t, hd);
@@ -235,14 +231,10 @@ namespace LLM.Core.Model
             var q = new Tensor(slots * t, hd);
             var k = new Tensor(slots * t, hd);
             var v = new Tensor(slots * t, hd);
-            _b.PackHeads(_qkv, q, batch, t, _nHeads, hd, 0);
-            _b.PackHeads(_qkv, k, batch, t, _nHeads, hd, _dModel);
-            _b.PackHeads(_qkv, v, batch, t, _nHeads, hd, 2 * _dModel);
+            _b.PackQkvHeads(_qkv, q, k, v, batch, t, _nHeads, hd);
             var probs = new Tensor(slots * t, t);
             _b.BatchedMatMulNT(q, k, probs, slots, t, hd, t);
-            _b.Scale(probs, _invScale);
-            _b.CausalMask(probs, t);
-            _b.SoftmaxForward(probs, slots * t, t);
+            _b.ScaledCausalSoftmaxForward(probs, slots * t, t, _invScale);
             _qkv = null; // release the forward cache right after the rebuild
 
             var dCtx = new Tensor(slots * t, hd);
@@ -254,8 +246,7 @@ namespace LLM.Core.Model
             _b.BatchedMatMulTN(probs, dCtx, dV, slots, t, t, hd);
 
             var dScores = new Tensor(slots * t, t);
-            _b.SoftmaxBackward(dProbs, probs, dScores, slots * t, t);
-            _b.Scale(dScores, _invScale);
+            _b.ScaledSoftmaxBackward(dProbs, probs, dScores, slots * t, t, _invScale);
 
             var dQ = new Tensor(slots * t, hd);
             _b.BatchedMatMulNN(dScores, k, dQ, slots, t, t, hd);
@@ -263,10 +254,7 @@ namespace LLM.Core.Model
             _b.BatchedMatMulTN(dScores, q, dK, slots, t, t, hd);
 
             var dQkv = new Tensor(dY.Shape[0], 3 * _dModel);
-            _b.Zero(dQkv); // the three unpacks below fully cover it — keep the device copy authoritative
-            _b.UnpackHeads(dQ, dQkv, batch, t, _nHeads, hd, 0);
-            _b.UnpackHeads(dK, dQkv, batch, t, _nHeads, hd, _dModel);
-            _b.UnpackHeads(dV, dQkv, batch, t, _nHeads, hd, 2 * _dModel);
+            _b.UnpackQkvHeads(dQ, dK, dV, dQkv, batch, t, _nHeads, hd);
             return Qkv.Backward(dQkv);
         }
     }

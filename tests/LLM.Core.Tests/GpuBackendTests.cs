@@ -469,6 +469,41 @@ namespace LLM.Core.Tests
                 NearRel(unGpu.Data[i], written ? unCpu.Data[i] : 0f, 0f, $"UnpackHeads [{i}]");
             }
 
+            // fused Q/K/V packing and unpacking match the composed backend contract
+            ITensorBackend cpu = Cpu;
+            var qCpu = new Tensor(batch * H * T, hd); var kCpu = new Tensor(batch * H * T, hd); var vCpu = new Tensor(batch * H * T, hd);
+            var qGpu = new Tensor(batch * H * T, hd); var kGpu = new Tensor(batch * H * T, hd); var vGpu = new Tensor(batch * H * T, hd);
+            cpu.PackQkvHeads(Dup(src, batch * T, 3 * D), qCpu, kCpu, vCpu, batch, T, H, hd);
+            gpu.PackQkvHeads(Dup(src, batch * T, 3 * D), qGpu, kGpu, vGpu, batch, T, H, hd);
+            gpu.EnsureHostCurrent(qGpu); gpu.EnsureHostCurrent(kGpu); gpu.EnsureHostCurrent(vGpu);
+            SpanNearRel(qGpu.Data, qCpu.Data, 0f, "PackQkvHeads Q");
+            SpanNearRel(kGpu.Data, kCpu.Data, 0f, "PackQkvHeads K");
+            SpanNearRel(vGpu.Data, vCpu.Data, 0f, "PackQkvHeads V");
+
+            var qkvCpu = new Tensor(batch * T, 3 * D); var qkvGpu = new Tensor(batch * T, 3 * D);
+            cpu.UnpackQkvHeads(qCpu, kCpu, vCpu, qkvCpu, batch, T, H, hd);
+            gpu.UnpackQkvHeads(qGpu, kGpu, vGpu, qkvGpu, batch, T, H, hd);
+            gpu.EnsureHostCurrent(qkvGpu);
+            SpanNearRel(qkvGpu.Data, qkvCpu.Data, 0f, "UnpackQkvHeads");
+
+            // fused scale + causal mask + softmax, and scaled backward
+            int attentionRows = batch * H * T;
+            float[] scores = Rand(attentionRows * T, rng), dOut = Rand(attentionRows * T, rng);
+            const float attentionScale = 0.375f;
+            var probsCpu = Dup(scores, attentionRows, T); var probsGpu = Dup(scores, attentionRows, T);
+            cpu.ScaledCausalSoftmaxForward(probsCpu, attentionRows, T, attentionScale);
+            gpu.ScaledCausalSoftmaxForward(probsGpu, attentionRows, T, attentionScale);
+            gpu.EnsureHostCurrent(probsGpu);
+            SpanNearRel(probsGpu.Data, probsCpu.Data, FwdTol, "ScaledCausalSoftmaxForward");
+
+            var dsCpu = new Tensor(attentionRows, T); var dsGpu = new Tensor(attentionRows, T);
+            cpu.ScaledSoftmaxBackward(Dup(dOut, attentionRows, T), probsCpu, dsCpu,
+                attentionRows, T, attentionScale);
+            gpu.ScaledSoftmaxBackward(Dup(dOut, attentionRows, T), probsGpu, dsGpu,
+                attentionRows, T, attentionScale);
+            gpu.EnsureHostCurrent(dsGpu);
+            SpanNearRel(dsGpu.Data, dsCpu.Data, BwdTol, "ScaledSoftmaxBackward");
+
             // batched matmuls, odd sizes + accumulate
             int slots = batch * H, M = T, K = hd, N = T;
             float[] a = Rand(slots * M * K, rng), bN = Rand(slots * K * N, rng), bT = Rand(slots * N * K, rng), prior = Rand(slots * M * N, rng);

@@ -54,6 +54,7 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     private readonly float[] _scalarHost = new float[1];
     private long _reductionReadbacks;
     private long _stridedBatchedMatMulCalls;
+    private long _fusedAttentionCalls;
 
     private readonly Action<Index1D, CudaKernels.BinaryArgs> _addInPlace, _copy, _geluForward;
     private readonly Action<Index1D, CudaKernels.CopyBlockArgs> _copyBlock;
@@ -63,11 +64,14 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     private readonly Action<Index1D, CudaKernels.GeluBackwardArgs> _geluBackward;
     private readonly Action<Index1D, CudaKernels.CausalMaskArgs> _causalMask;
     private readonly Action<Index1D, CudaKernels.HeadPackArgs> _packHeads, _unpackHeads;
+    private readonly Action<Index1D, CudaKernels.QkvHeadPackArgs> _packQkvHeads;
+    private readonly Action<Index1D, CudaKernels.QkvHeadUnpackArgs> _unpackQkvHeads;
     private readonly Action<Index1D, CudaKernels.SumRowsArgs> _sumRows;
     private readonly Action<Index1D, CudaKernels.LayerNormForwardArgs> _layerNormForward;
     private readonly Action<Index1D, CudaKernels.LayerNormBackwardDxArgs> _layerNormBackwardDx;
     private readonly Action<Index1D, CudaKernels.LayerNormBackwardParamsArgs> _layerNormBackwardParams;
     private readonly Action<KernelConfig, CudaKernels.UnaryArgs> _softmaxForward;
+    private readonly Action<KernelConfig, CudaKernels.ScaledCausalSoftmaxArgs> _scaledCausalSoftmaxForward;
     private readonly Action<KernelConfig, CudaKernels.SoftmaxBackwardArgs> _softmaxBackward;
     private readonly Action<Index1D, CudaKernels.EmbeddingArgs> _embeddingForward, _embeddingBackward;
     private readonly Action<Index1D, CudaKernels.CrossEntropyForwardArgs> _crossEntropyForward;
@@ -132,6 +136,10 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             _packHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.HeadPackArgs>(CudaKernels.PackHeads);
             stage = nameof(CudaKernels.UnpackHeads);
             _unpackHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.HeadPackArgs>(CudaKernels.UnpackHeads);
+            stage = nameof(CudaKernels.PackQkvHeads);
+            _packQkvHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.QkvHeadPackArgs>(CudaKernels.PackQkvHeads);
+            stage = nameof(CudaKernels.UnpackQkvHeads);
+            _unpackQkvHeads = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.QkvHeadUnpackArgs>(CudaKernels.UnpackQkvHeads);
             stage = nameof(CudaKernels.SumRows);
             _sumRows = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.SumRowsArgs>(CudaKernels.SumRows);
             stage = nameof(CudaKernels.LayerNormForward);
@@ -142,6 +150,8 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             _layerNormBackwardParams = accelerator.LoadAutoGroupedStreamKernel<Index1D, CudaKernels.LayerNormBackwardParamsArgs>(CudaKernels.LayerNormBackwardParams);
             stage = nameof(CudaKernels.SoftmaxForward);
             _softmaxForward = accelerator.LoadStreamKernel<CudaKernels.UnaryArgs>(CudaKernels.SoftmaxForward);
+            stage = nameof(CudaKernels.ScaledCausalSoftmaxForward);
+            _scaledCausalSoftmaxForward = accelerator.LoadStreamKernel<CudaKernels.ScaledCausalSoftmaxArgs>(CudaKernels.ScaledCausalSoftmaxForward);
             stage = nameof(CudaKernels.SoftmaxBackward);
             _softmaxBackward = accelerator.LoadStreamKernel<CudaKernels.SoftmaxBackwardArgs>(CudaKernels.SoftmaxBackward);
             stage = nameof(CudaKernels.EmbeddingForward);
@@ -233,6 +243,11 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
     internal long StridedBatchedMatMulCallCount
     {
         get { lock (_gate) return _stridedBatchedMatMulCalls; }
+    }
+
+    internal long FusedAttentionCallCount
+    {
+        get { lock (_gate) return _fusedAttentionCalls; }
     }
 
     internal static int BucketOf(int length)
@@ -579,6 +594,32 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
         }
     }
 
+    public void PackQkvHeads(TensorValue src, TensorValue q, TensorValue k, TensorValue v,
+        int batch, int T, int nHeads, int headDim)
+    {
+        lock (_gate)
+        {
+            Chunk s = Read(src), cq = Write(q), ck = Write(k), cv = Write(v);
+            _packQkvHeads(q.Length, new CudaKernels.QkvHeadPackArgs(
+                View(s, src.Length), View(cq, q.Length), View(ck, k.Length), View(cv, v.Length),
+                src.Cols, T, headDim, nHeads, q.Length));
+            _fusedAttentionCalls++;
+        }
+    }
+
+    public void UnpackQkvHeads(TensorValue q, TensorValue k, TensorValue v, TensorValue dst,
+        int batch, int T, int nHeads, int headDim)
+    {
+        lock (_gate)
+        {
+            Chunk cq = Read(q), ck = Read(k), cv = Read(v), d = Write(dst);
+            _unpackQkvHeads(q.Length, new CudaKernels.QkvHeadUnpackArgs(
+                View(cq, q.Length), View(ck, k.Length), View(cv, v.Length), View(d, dst.Length),
+                dst.Cols, T, headDim, nHeads, q.Length));
+            _fusedAttentionCalls++;
+        }
+    }
+
     public void AddBias(TensorValue y, TensorValue bias, int rows, int cols)
     {
         lock (_gate)
@@ -688,6 +729,29 @@ public sealed class CudaBackend : ITensorBackend, IDisposable
             Chunk cdo = Read(dOut), cs = Read(softmaxOut), cdx = Write(dX);
             _softmaxBackward((rows, 256), new CudaKernels.SoftmaxBackwardArgs(
                 View(cdo, dOut.Length), View(cs, softmaxOut.Length), View(cdx, dX.Length), rows, cols));
+        }
+    }
+
+    public void ScaledCausalSoftmaxForward(TensorValue scores, int rows, int T, float scale)
+    {
+        lock (_gate)
+        {
+            Chunk cs = Write(scores, true);
+            _scaledCausalSoftmaxForward((rows, 256), new CudaKernels.ScaledCausalSoftmaxArgs(
+                View(cs, scores.Length), rows, T, scale));
+            _fusedAttentionCalls++;
+        }
+    }
+
+    public void ScaledSoftmaxBackward(TensorValue dOut, TensorValue softmaxOut, TensorValue dX,
+        int rows, int cols, float scale)
+    {
+        lock (_gate)
+        {
+            Chunk cdo = Read(dOut), cs = Read(softmaxOut), cdx = Write(dX);
+            _softmaxBackward((rows, 256), new CudaKernels.SoftmaxBackwardArgs(
+                View(cdo, dOut.Length), View(cs, softmaxOut.Length), View(cdx, dX.Length), rows, cols, scale));
+            _fusedAttentionCalls++;
         }
     }
 

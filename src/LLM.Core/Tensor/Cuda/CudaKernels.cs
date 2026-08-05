@@ -91,6 +91,41 @@ public static class CudaKernels
         }
     }
 
+    public readonly struct QkvHeadPackArgs
+    {
+        public readonly ArrayView<float> Source, Q, K, V;
+        public readonly int MatrixCols, T, HeadDim, Heads, Length;
+        public QkvHeadPackArgs(ArrayView<float> source, ArrayView<float> q,
+            ArrayView<float> k, ArrayView<float> v, int matrixCols,
+            int t, int headDim, int heads, int length)
+        {
+            Source = source; Q = q; K = k; V = v; MatrixCols = matrixCols;
+            T = t; HeadDim = headDim; Heads = heads; Length = length;
+        }
+    }
+
+    public readonly struct QkvHeadUnpackArgs
+    {
+        public readonly ArrayView<float> Q, K, V, Destination;
+        public readonly int MatrixCols, T, HeadDim, Heads, Length;
+        public QkvHeadUnpackArgs(ArrayView<float> q, ArrayView<float> k,
+            ArrayView<float> v, ArrayView<float> destination, int matrixCols,
+            int t, int headDim, int heads, int length)
+        {
+            Q = q; K = k; V = v; Destination = destination; MatrixCols = matrixCols;
+            T = t; HeadDim = headDim; Heads = heads; Length = length;
+        }
+    }
+
+    public readonly struct ScaledCausalSoftmaxArgs
+    {
+        public readonly ArrayView<float> Scores;
+        public readonly int Rows, T;
+        public readonly float Scale;
+        public ScaledCausalSoftmaxArgs(ArrayView<float> scores, int rows, int t, float scale)
+        { Scores = scores; Rows = rows; T = t; Scale = scale; }
+    }
+
     public readonly struct SumRowsArgs
     {
         public readonly ArrayView<float> DY, DBias;
@@ -133,8 +168,10 @@ public static class CudaKernels
     {
         public readonly ArrayView<float> DOut, Softmax, DX;
         public readonly int Rows, Cols;
-        public SoftmaxBackwardArgs(ArrayView<float> dOut, ArrayView<float> softmax, ArrayView<float> dX, int rows, int cols)
-        { DOut = dOut; Softmax = softmax; DX = dX; Rows = rows; Cols = cols; }
+        public readonly float Scale;
+        public SoftmaxBackwardArgs(ArrayView<float> dOut, ArrayView<float> softmax,
+            ArrayView<float> dX, int rows, int cols, float scale = 1f)
+        { DOut = dOut; Softmax = softmax; DX = dX; Rows = rows; Cols = cols; Scale = scale; }
     }
 
     public readonly struct EmbeddingArgs
@@ -291,6 +328,34 @@ public static class CudaKernels
         a.Destination[(seq * a.T + row) * a.MatrixCols + a.ColBase + head * a.HeadDim + d] = a.Source[i];
     }
 
+    public static void PackQkvHeads(Index1D index, QkvHeadPackArgs a)
+    {
+        int i = index;
+        if (i >= a.Length) return;
+        int slot = i / (a.T * a.HeadDim), r = i % (a.T * a.HeadDim);
+        int row = r / a.HeadDim, d = r % a.HeadDim;
+        int seq = slot / a.Heads, head = slot % a.Heads;
+        int dModel = a.Heads * a.HeadDim;
+        int source = (seq * a.T + row) * a.MatrixCols + head * a.HeadDim + d;
+        a.Q[i] = a.Source[source];
+        a.K[i] = a.Source[source + dModel];
+        a.V[i] = a.Source[source + 2 * dModel];
+    }
+
+    public static void UnpackQkvHeads(Index1D index, QkvHeadUnpackArgs a)
+    {
+        int i = index;
+        if (i >= a.Length) return;
+        int slot = i / (a.T * a.HeadDim), r = i % (a.T * a.HeadDim);
+        int row = r / a.HeadDim, d = r % a.HeadDim;
+        int seq = slot / a.Heads, head = slot % a.Heads;
+        int dModel = a.Heads * a.HeadDim;
+        int destination = (seq * a.T + row) * a.MatrixCols + head * a.HeadDim + d;
+        a.Destination[destination] = a.Q[i];
+        a.Destination[destination + dModel] = a.K[i];
+        a.Destination[destination + 2 * dModel] = a.V[i];
+    }
+
     public static void SumRows(Index1D index, SumRowsArgs a)
     {
         int c = index;
@@ -376,6 +441,34 @@ public static class CudaKernels
         for (int c = lane; c < a.Length; c += 256) a.X[o + c] *= inv;
     }
 
+    public static void ScaledCausalSoftmaxForward(ScaledCausalSoftmaxArgs a)
+    {
+        int row = Grid.IdxX, lane = Group.IdxX;
+        if (row >= a.Rows) return;
+        ArrayView<float> reduction = SharedMemory.Allocate<float>(256);
+        int o = row * a.T, query = row % a.T;
+        for (int c = lane; c < a.T; c += 256)
+            a.Scores[o + c] = c <= query ? a.Scores[o + c] * a.Scale : float.NegativeInfinity;
+        Group.Barrier();
+
+        float max = float.NegativeInfinity;
+        for (int c = lane; c < a.T; c += 256) max = MathF.Max(max, a.Scores[o + c]);
+        reduction[lane] = max;
+        Group.Barrier();
+        for (int s = 128; s > 0; s >>= 1)
+        { if (lane < s) reduction[lane] = MathF.Max(reduction[lane], reduction[lane + s]); Group.Barrier(); }
+        max = reduction[0];
+        float sum = 0f;
+        for (int c = lane; c < a.T; c += 256)
+        { float e = MathF.Exp(a.Scores[o + c] - max); a.Scores[o + c] = e; sum += e; }
+        reduction[lane] = sum;
+        Group.Barrier();
+        for (int s = 128; s > 0; s >>= 1)
+        { if (lane < s) reduction[lane] += reduction[lane + s]; Group.Barrier(); }
+        float inv = 1f / reduction[0];
+        for (int c = lane; c < a.T; c += 256) a.Scores[o + c] *= inv;
+    }
+
     public static void SoftmaxBackward(SoftmaxBackwardArgs a)
     {
         int row = Grid.IdxX, lane = Group.IdxX;
@@ -389,7 +482,7 @@ public static class CudaKernels
         { if (lane < s) reduction[lane] += reduction[lane + s]; Group.Barrier(); }
         dot = reduction[0];
         for (int c = lane; c < a.Cols; c += 256)
-            a.DX[o + c] = a.Softmax[o + c] * (a.DOut[o + c] - dot);
+            a.DX[o + c] = a.Softmax[o + c] * (a.DOut[o + c] - dot) * a.Scale;
     }
 
     public static void EmbeddingForward(Index1D index, EmbeddingArgs a)
