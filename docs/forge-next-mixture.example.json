@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "trainTokens": 4400000000,
+  "validationTokens": 100000000,
+  "sources": [
+    {
+      "name": "fineweb-edu",
+      "path": "../data/forge-next/fineweb-edu",
+      "weight": 0.8
+    },
+    {
+      "name": "fineweb-breadth",
+      "path": "../data/forge-next/fineweb",
+      "weight": 0.2
+    }
+  ]
+}

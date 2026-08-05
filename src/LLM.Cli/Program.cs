@@ -26,6 +26,7 @@ try
     {
         "prepare" => Cli.Prepare(args[1..]),
         "prepare-fineweb" => Cli.PrepareFineWeb(args[1..]),
+        "prepare-mixture" => Cli.PrepareMixture(args[1..]),
         "train" => Cli.Train(args[1..]),
         "benchmark" => Cli.Benchmark(args[1..]),
         "generate" => Cli.Generate(args[1..]),
@@ -57,8 +58,12 @@ internal static partial class Cli
         Usage:
           llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
           llm prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb] [--shards 10]
-                              [--merges 16000] [--toktrainmb 200] [--rebuild true]
-          llm train     --data <dir> [--preset forge-98m] [--steps 5000 | --tokens N | --epochs 1]
+                              [--merges 16000] [--toktrainmb 200] [--tokenizer <path>]
+                              [--exclude-index <corpus.idx>]
+                              [--rebuild true]
+          llm prepare-mixture --manifest <mixture.json> --out <dir> [--rebuild true]
+          llm train     --data <dir> [--preset forge-98m|forge-220m|forge-320m]
+                        [--steps 5000 | --tokens N | --epochs 1]
                         [--name Forge-98M] [--dmodel 128] [--layers 4] [--heads 4]
                         [--ctx 128] [--batch 8] [--accum 16] [--lr 6e-4] [--minlr 6e-5]
                         [--warmup 100 | --warmup-tokens N] [--wd 0.1]
@@ -67,8 +72,9 @@ internal static partial class Cli
                         [--saveevery 0] [--out out/model.bin] [--init <checkpoint>]
                         [--backend auto|cpu|gpu|cuda]
                         [--matmul-precision custom|fp32|tf32]
-          llm benchmark [--backend cuda] [--batch 4] [--accum 16] [--steps 3]
-                        [--vocab 16257] [--ctx 512] [--dmodel 768] [--layers 12] [--heads 12]
+          llm benchmark [--preset forge-98m|forge-220m|forge-320m]
+                        [--backend cuda] [--batch N] [--accum N] [--steps 3]
+                        [--vocab 16257] [--ctx N] [--dmodel N] [--layers N] [--heads N]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
                         [--repetition-penalty 1.0] [--no-repeat-ngram 0]
@@ -273,19 +279,22 @@ internal static partial class Cli
 
                   --backend cuda|gpu|cpu       backend (default cuda)
                   --matmul-precision custom|fp32|tf32
-                  --vocab 16257 --ctx 512 --dmodel 768 --layers 12 --heads 12
-                  --batch 4 --accum 16 --steps 3
+                  --preset forge-98m|forge-220m|forge-320m (default forge-98m)
+                  --vocab 16257; architecture flags may override the preset
+                  --batch N --accum N --steps 3
                 """);
             return 0;
         }
 
+        string presetKey = p.Get("preset", "forge-98m");
+        ModelPreset preset = ModelPresets.Get(presetKey);
         int vocab = p.GetInt("vocab", 16257);
-        int ctx = p.GetInt("ctx", 512);
-        int dmodel = p.GetInt("dmodel", 768);
-        int layers = p.GetInt("layers", 12);
-        int heads = p.GetInt("heads", 12);
-        int batch = p.GetInt("batch", 4);
-        int accumulation = p.GetInt("accum", 16);
+        int ctx = p.GetInt("ctx", preset.ContextLength);
+        int dmodel = p.GetInt("dmodel", preset.DModel);
+        int layers = p.GetInt("layers", preset.Layers);
+        int heads = p.GetInt("heads", preset.Heads);
+        int batch = p.GetInt("batch", preset.DefaultBatch);
+        int accumulation = p.GetInt("accum", preset.DefaultAccumulation);
         int steps = p.GetInt("steps", 3);
         int seed = p.GetInt("seed", 42);
         string backendName = p.Get("backend", "cuda");
@@ -299,7 +308,7 @@ internal static partial class Cli
         ITensorBackend backend = CreateBackend(backendName, cudaMatMulMode);
         try
         {
-            var model = new GptModel(config, backend, new Random(seed), "Forge-98M");
+            var model = new GptModel(config, backend, new Random(seed), preset.ModelName);
             long tokensPerUpdate = checked((long)batch * ctx * accumulation);
             long dataTokens = checked(tokensPerUpdate * (steps + 2) + 1);
             if (dataTokens > int.MaxValue)
@@ -325,7 +334,7 @@ internal static partial class Cli
                 ValEvery = 0,
             };
 
-            Console.WriteLine($"benchmark: warmup 1 update; model {model.Params.Count:N0} params; " +
+            Console.WriteLine($"benchmark: preset {preset.Key}; warmup 1 update; model {model.Params.Count:N0} params; " +
                               $"microbatch {batch} x {ctx}; accum {accumulation}; {tokensPerUpdate:N0} tok/update");
             Trainer.Train(model, data, val: null, Options(1));
             TrainSummary summary = Trainer.Train(model, data, val: null, Options(steps));
@@ -351,9 +360,12 @@ internal static partial class Cli
                 llm train --data <dir> [options]
 
                   Trains Forge on tokenizer.json + train.bin/val.bin produced by
-                  `prepare`. --preset forge-98m selects 768/12/12/512, a safe
-                  batch 4 / accum 16 starting point, the Forge-98M name, and
-                  out/forge-98m.bin. Explicit flags can override preset defaults.
+                  `prepare`. Reviewed presets are forge-98m (768/12/12/512),
+                  forge-220m (1024/16/16/1024), and forge-320m
+                  (1024/24/16/1024). Each selects a conservative starting batch,
+                  model name, and output path. Explicit flags override defaults.
+                  A preset never supplies a training budget: use exactly one of
+                  --steps, --tokens, or --epochs for a full run.
                   --epochs derives the token budget from train.bin.
                   Each physical pass processes --batch sequences (custom default 8,
                   Forge-98M preset 4); --accum physical passes are averaged into each
@@ -377,20 +389,17 @@ internal static partial class Cli
         }
 
         string dataDir = p.Require("data");
-        string preset = p.Get("preset", "custom");
-        bool forge98M = preset switch
-        {
-            "custom" => false,
-            "forge-98m" => true,
-            _ => throw new ArgumentException("--preset must be forge-98m or omitted."),
-        };
+        string presetKey = p.Get("preset", "custom");
+        ModelPreset? preset = presetKey.Equals("custom", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : ModelPresets.Get(presetKey);
         int? stepsArg = p.GetInt("steps");
         long? tokensArg = p.GetLong("tokens");
         float? epochsArg = p.GetFloat("epochs");
-        int dmodel = p.GetInt("dmodel", forge98M ? 768 : 128);
-        int layers = p.GetInt("layers", forge98M ? 12 : 4);
-        int heads = p.GetInt("heads", forge98M ? 12 : 4);
-        int ctx = p.GetInt("ctx", forge98M ? 512 : 128);
+        int dmodel = p.GetInt("dmodel", preset?.DModel ?? 128);
+        int layers = p.GetInt("layers", preset?.Layers ?? 4);
+        int heads = p.GetInt("heads", preset?.Heads ?? 4);
+        int ctx = p.GetInt("ctx", preset?.ContextLength ?? 128);
         int? batchArg = p.GetInt("batch");
         int? accumulationArg = p.GetInt("accum");
         float? lrArg = p.GetFloat("lr");
@@ -404,8 +413,8 @@ internal static partial class Cli
         int valevery = p.GetInt("valevery", 250);
         int valbatches = p.GetInt("valbatches", 50);
         int valseed = p.GetInt("valseed", 424242);
-        string modelName = p.Get("name", forge98M ? "Forge-98M" : "Forge");
-        string outPath = p.Get("out", Path.Combine("out", forge98M ? "forge-98m.bin" : "model.bin"));
+        string modelName = p.Get("name", preset?.ModelName ?? "Forge");
+        string outPath = p.Get("out", preset?.DefaultCheckpoint ?? Path.Combine("out", "model.bin"));
         string? init = p.Get("init");
         int saveevery = p.GetInt("saveevery", 0);
         string backendName = p.Get("backend", "auto");
@@ -416,6 +425,9 @@ internal static partial class Cli
                           (epochsArg is not null ? 1 : 0);
         if (budgetFlags > 1)
             throw new ArgumentException("Use only one of --steps, --tokens, or --epochs.");
+        if (preset is not null && (preset.Key is "forge-220m" or "forge-320m") && budgetFlags == 0)
+            throw new ArgumentException(
+                $"--preset {preset.Key} requires an explicit --steps, --tokens, or --epochs budget.");
         if (epochsArg is float epochs && (!float.IsFinite(epochs) || epochs <= 0f))
             throw new ArgumentException("--epochs must be finite and > 0.");
         if (warmupArg is not null && warmupTokensArg is not null)
@@ -446,8 +458,8 @@ internal static partial class Cli
         }
 
         TrainingConfiguration? stored = trainState?.Configuration;
-        int batch = batchArg ?? stored?.BatchSize ?? (forge98M ? 4 : 8);
-        int accumulation = accumulationArg ?? stored?.AccumulationSteps ?? 16;
+        int batch = batchArg ?? stored?.BatchSize ?? preset?.DefaultBatch ?? 8;
+        int accumulation = accumulationArg ?? stored?.AccumulationSteps ?? preset?.DefaultAccumulation ?? 16;
         if (batch < 1) throw new ArgumentException("--batch must be >= 1.");
         if (accumulation < 1) throw new ArgumentException("--accum must be >= 1.");
         long tokensPerUpdate = checked((long)batch * model.Config.ContextLength * accumulation);

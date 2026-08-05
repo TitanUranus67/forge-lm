@@ -29,6 +29,24 @@ public static class Check
         if (worst > tol) Fail($"max abs diff {worst} > {tol}: {msg}");
     }
 
+    public static void Throws<T>(Action action, string expectedMessageContains) where T : Exception
+    {
+        try
+        {
+            action();
+            Fail($"expected {typeof(T).Name} containing '{expectedMessageContains}', but no exception was thrown");
+        }
+        catch (T ex)
+        {
+            if (!ex.Message.Contains(expectedMessageContains, StringComparison.OrdinalIgnoreCase))
+                Fail($"expected {typeof(T).Name} containing '{expectedMessageContains}', got '{ex.Message}'");
+        }
+        catch (Exception ex)
+        {
+            Fail($"expected {typeof(T).Name}, got {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     public static void Fail(string msg)
     {
         Failures++;

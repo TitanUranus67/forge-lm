@@ -28,9 +28,9 @@ internal static partial class Cli
 
     private sealed record ShardIdentity(string Path, long Size);
     private sealed record CorpusManifest(int Version, string Dataset, ShardIdentity[] Shards, long CorpusBytes,
-        long DocumentIndexBytes, long Documents);
+        long DocumentIndexBytes, long Documents, string? ExclusionIndexSha256 = null);
     private sealed record TokenizerManifest(int Version, string CorpusId, int Merges, int TrainingMegabytes,
-        int VocabularySize, string TokenizerSha256);
+        int VocabularySize, string TokenizerSha256, string? ExternalTokenizerSha256 = null);
     private sealed record DataManifest(int Version, string CorpusId, string TokenizerSha256,
         long Tokens, long TrainBytes, long ValBytes);
 
@@ -42,7 +42,8 @@ internal static partial class Cli
             Console.WriteLine("""
                 llm prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb]
                     [--shards 10] [--merges 16000] [--toktrainmb 200]
-                    [--encode-workers <up-to-8>] [--rebuild true]
+                    [--encode-workers <up-to-8>] [--tokenizer <path>]
+                    [--exclude-index <corpus.idx>] [--rebuild true]
 
                   Downloads the first --shards parquet shards of FineWeb-Edu sample-10BT
                   by default (`--dataset fineweb` selects unfiltered FineWeb)
@@ -54,6 +55,10 @@ internal static partial class Cli
                   EOS into tokenizer.json + train.bin/val.bin (about 90/10, LE uint16).
                   Document encoding uses --encode-workers concurrent workers while
                   preserving deterministic document order and byte-identical outputs.
+                  --tokenizer imports an existing tokenizer so independently prepared
+                  sources can later be combined by `prepare-mixture`.
+                  --exclude-index skips documents whose stable identity occurs in a
+                  previously prepared corpus.idx, preventing cross-source duplicates.
                   Derived artifacts are written transactionally and accompanied by
                   manifests. A stale or unverifiable corpus is never silently reused;
                   use --rebuild true to regenerate it while keeping downloaded shards.
@@ -67,6 +72,8 @@ internal static partial class Cli
         int merges = p.GetInt("merges", 16000);
         int tokTrainMb = p.GetInt("toktrainmb", 200);
         int encodeWorkers = p.GetInt("encode-workers", Math.Min(8, Environment.ProcessorCount));
+        string? externalTokenizerPath = p.Get("tokenizer");
+        string? exclusionIndexPath = p.Get("exclude-index");
         bool rebuild = p.GetBool("rebuild", false);
         p.Done();
 
@@ -127,6 +134,9 @@ internal static partial class Cli
         }
 
         ShardIdentity[] expectedShards = wanted.Select(s => new ShardIdentity(s.Path, s.Size)).ToArray();
+        string? exclusionIndexSha = exclusionIndexPath is null
+            ? null
+            : FileSha256(Path.GetFullPath(exclusionIndexPath));
 
         // 2. extract text plus a byte-length index so real document boundaries survive encoding
         long docs;
@@ -134,6 +144,7 @@ internal static partial class Cli
         bool corpusVerified = File.Exists(corpusPath) && File.Exists(documentIndexPath) && corpusManifest is not null &&
             corpusManifest.Version == FineWebManifestVersion &&
             corpusManifest.Dataset == source.Name && corpusManifest.Shards.SequenceEqual(expectedShards) &&
+            corpusManifest.ExclusionIndexSha256 == exclusionIndexSha &&
             new FileInfo(corpusPath).Length == corpusManifest.CorpusBytes &&
             new FileInfo(documentIndexPath).Length == corpusManifest.DocumentIndexBytes &&
             corpusManifest.DocumentIndexBytes == corpusManifest.Documents * DocumentIndexRecordBytes;
@@ -154,12 +165,17 @@ internal static partial class Cli
             if (File.Exists(documentIndexTmp)) File.Delete(documentIndexTmp);
             var sw = Stopwatch.StartNew();
             docs = 0;
+            HashSet<ulong>? excludedDocumentKeys = exclusionIndexPath is null
+                ? null
+                : ReadDocumentIdentityKeys(Path.GetFullPath(exclusionIndexPath));
+            if (excludedDocumentKeys is not null)
+                Console.WriteLine($"extract: excluding {excludedDocumentKeys.Count:N0} known document identities");
             foreach (string shard in localShards)
-                docs += ExtractText(shard, corpusTmp, documentIndexTmp).GetAwaiter().GetResult();
+                docs += ExtractText(shard, corpusTmp, documentIndexTmp, excludedDocumentKeys).GetAwaiter().GetResult();
             File.Move(corpusTmp, corpusPath, overwrite: true);
             File.Move(documentIndexTmp, documentIndexPath, overwrite: true);
             corpusManifest = new CorpusManifest(FineWebManifestVersion, source.Name, expectedShards,
-                new FileInfo(corpusPath).Length, new FileInfo(documentIndexPath).Length, docs);
+                new FileInfo(corpusPath).Length, new FileInfo(documentIndexPath).Length, docs, exclusionIndexSha);
             WriteManifest(corpusManifestPath, corpusManifest);
             Console.WriteLine($"corpus: {docs:N0} docs, {new FileInfo(corpusPath).Length:N0} bytes " +
                               $"in {sw.Elapsed.TotalSeconds:F1}s");
@@ -171,11 +187,16 @@ internal static partial class Cli
         string tokOut = Path.Combine(outDir, "tokenizer.json");
         string tokTmp = tokOut + ".tmp";
         BpeTokenizer tok;
+        string? externalTokenizerSha = externalTokenizerPath is null
+            ? null
+            : FileSha256(Path.GetFullPath(externalTokenizerPath));
         TokenizerManifest? tokenizerManifest = ReadManifest<TokenizerManifest>(tokenizerManifestPath);
         bool tokenizerVerified = File.Exists(tokOut) && tokenizerManifest is not null &&
             tokenizerManifest.Version == FineWebManifestVersion &&
-            tokenizerManifest.CorpusId == corpusId && tokenizerManifest.Merges == merges &&
-            tokenizerManifest.TrainingMegabytes == tokTrainMb &&
+            tokenizerManifest.CorpusId == corpusId &&
+            tokenizerManifest.ExternalTokenizerSha256 == externalTokenizerSha &&
+            (externalTokenizerSha is not null ||
+             (tokenizerManifest.Merges == merges && tokenizerManifest.TrainingMegabytes == tokTrainMb)) &&
             tokenizerManifest.TokenizerSha256 == FileSha256(tokOut);
         if (tokenizerVerified)
         {
@@ -187,21 +208,29 @@ internal static partial class Cli
         else
         {
             if (File.Exists(tokTmp)) File.Delete(tokTmp);
-            List<byte[]> trainingDocuments = ReadTokenizerTrainingDocuments(corpusPath, documentIndexPath,
-                corpusBytes, tokTrainMb << 20);
-            long trainingBytes = trainingDocuments.Sum(document => (long)document.Length);
-            Console.WriteLine($"tokenizer: training {merges} merges on {trainingDocuments.Count:N0} " +
-                              $"sampled train docs ({trainingBytes / (double)(1 << 20):F1} MB)...");
-            var sw = Stopwatch.StartNew();
-            tok = BpeTokenizer.TrainDocuments(trainingDocuments, merges, (done, total) =>
+            if (externalTokenizerPath is not null)
             {
-                if (done % 100 == 0 || done == total)
-                    Console.WriteLine($"tokenizer: {done}/{total} merges ({sw.Elapsed.TotalSeconds:F1}s)");
-            });
+                tok = BpeTokenizer.Load(Path.GetFullPath(externalTokenizerPath));
+                Console.WriteLine($"tokenizer: importing {externalTokenizerPath} (vocab {tok.VocabSize})");
+            }
+            else
+            {
+                List<byte[]> trainingDocuments = ReadTokenizerTrainingDocuments(corpusPath, documentIndexPath,
+                    corpusBytes, tokTrainMb << 20);
+                long trainingBytes = trainingDocuments.Sum(document => (long)document.Length);
+                Console.WriteLine($"tokenizer: training {merges} merges on {trainingDocuments.Count:N0} " +
+                                  $"sampled train docs ({trainingBytes / (double)(1 << 20):F1} MB)...");
+                var sw = Stopwatch.StartNew();
+                tok = BpeTokenizer.TrainDocuments(trainingDocuments, merges, (done, total) =>
+                {
+                    if (done % 100 == 0 || done == total)
+                        Console.WriteLine($"tokenizer: {done}/{total} merges ({sw.Elapsed.TotalSeconds:F1}s)");
+                });
+            }
             tok.Save(tokTmp);
             File.Move(tokTmp, tokOut, overwrite: true);
             tokenizerManifest = new TokenizerManifest(FineWebManifestVersion, corpusId, merges,
-                tokTrainMb, tok.VocabSize, FileSha256(tokOut));
+                tokTrainMb, tok.VocabSize, FileSha256(tokOut), externalTokenizerSha);
             WriteManifest(tokenizerManifestPath, tokenizerManifest);
             Console.WriteLine($"tokenizer: saved {tokOut} (vocab {tok.VocabSize})");
         }
@@ -339,7 +368,8 @@ internal static partial class Cli
     /// URL-hash split, and tokenizer-sampling key, so duplicates of a URL cannot cross
     /// train/validation and preparation remains deterministic.
     /// </summary>
-    private static async Task<long> ExtractText(string shardPath, string corpusPath, string documentIndexPath)
+    private static async Task<long> ExtractText(string shardPath, string corpusPath, string documentIndexPath,
+        HashSet<ulong>? excludedDocumentKeys)
     {
         Console.WriteLine($"extract: {Path.GetFileName(shardPath)}");
         using var input = File.OpenRead(shardPath);
@@ -364,18 +394,39 @@ internal static partial class Cli
                 string? text = rows[row];
                 if (!string.IsNullOrEmpty(text))
                 {
-                    writer.Write(text);
-                    writer.Write('\n');
                     string identity = string.IsNullOrEmpty(urls[row]) ? text : urls[row]!;
                     byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(identity));
+                    ulong sampleKey = BinaryPrimitives.ReadUInt64LittleEndian(hash.AsSpan(sizeof(ulong)));
+                    if (excludedDocumentKeys?.Contains(sampleKey) == true)
+                        continue;
+                    writer.Write(text);
+                    writer.Write('\n');
                     index.Write((long)Encoding.UTF8.GetByteCount(text) + 1);
                     index.Write(BinaryPrimitives.ReadUInt64LittleEndian(hash) % 10UL == 0UL);
-                    index.Write(BinaryPrimitives.ReadUInt64LittleEndian(hash.AsSpan(sizeof(ulong))));
+                    index.Write(sampleKey);
                     docs++;
                 }
             }
         }
         return docs;
+    }
+
+    private static HashSet<ulong> ReadDocumentIdentityKeys(string documentIndexPath)
+    {
+        var file = new FileInfo(documentIndexPath);
+        if (!file.Exists) throw new FileNotFoundException("Exclusion document index not found.", file.FullName);
+        if (file.Length % DocumentIndexRecordBytes != 0)
+            throw new InvalidDataException($"Exclusion index '{file.FullName}' has an invalid length.");
+        var keys = new HashSet<ulong>();
+        using var index = new BinaryReader(new FileStream(file.FullName, FileMode.Open, FileAccess.Read,
+            FileShare.Read, 1 << 20, FileOptions.SequentialScan));
+        while (index.BaseStream.Position < index.BaseStream.Length)
+        {
+            index.ReadInt64();
+            index.ReadBoolean();
+            keys.Add(index.ReadUInt64());
+        }
+        return keys;
     }
 
     /// <summary>

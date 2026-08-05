@@ -17,7 +17,7 @@ dotnet run --project tests/LLM.Core.Tests   # CUDA/D3D12 tests skip cleanly when
 
 ## Quickstart
 
-The CLI has five subcommands (tokenizer training is folded into `prepare`):
+The CLI has seven subcommands (tokenizer training is folded into `prepare`):
 
 ```sh
 # 1. Download tiny-shakespeare, train a BPE tokenizer, encode to train/val bins
@@ -26,6 +26,10 @@ dotnet run --project src/LLM.Cli -- prepare --out data/shakes --merges 2000
 # 1b. Or build a real corpus: download N FineWeb-Edu (sample-10BT) shards,
 #     isolate validation by URL, train tokenizer, and stream-encode (takes hours)
 dotnet run --project src/LLM.Cli -- prepare-fineweb --out data/forge --shards 3 --merges 16000
+
+# Build a deterministic weighted dataset from compatible prepared sources
+dotnet run --project src/LLM.Cli -- prepare-mixture \
+    --manifest docs/forge-next-mixture.example.json --out data/forge-next/mixed
 
 # Train Forge-98M for the fixed 1.024B-token budget; benchmark the Vast GPU first
 # and override batch/accum/matmul with its winning configuration
@@ -53,7 +57,7 @@ dotnet run --project src/LLM.Cli -- chat --model out/model.bin --tokenizer data/
 
 # Benchmark the full training shape without reading data or writing a checkpoint
 dotnet run -c Release --project src/LLM.Cli -- benchmark --backend cuda \
-    --matmul-precision fp32 --batch 4 --accum 16 --steps 3
+    --preset forge-220m --matmul-precision fp32 --batch 1 --accum 32 --steps 3
 ```
 
 All flags are optional where a default exists; run any command with `--help` for
@@ -86,6 +90,15 @@ fail loudly if unavailable. The selected backend and device are printed at start
   transactionally with provenance manifests; stale or incomplete artifacts are
   never silently reused. `--rebuild true` regenerates derived artifacts while
   retaining downloaded shards.
+- `prepare-mixture` combines two or more prepared sources that use byte-identical
+  tokenizers. A versioned JSON specification supplies source directories, positive
+  weights, and train/validation token targets. The mixer deterministically balances
+  emitted tokens while copying complete EOS-terminated documents, refuses insufficient
+  or stale inputs, and records provenance in `.forge-mixture.json`. FineWeb preparation
+  accepts `--tokenizer` so every source can share the tokenizer trained on the primary
+  corpus. `--exclude-index` removes stable document identities already present in a
+  prior `corpus.idx`, avoiding overlap when a derived corpus is mixed with its parent.
+  See [the next-run plan](docs/forge-next-run.md) for the reviewed 80/20 mix.
 - `train` runs a batched training loop. Each physical `[B*T, C]` pass contains
   `--batch N` sequences (default 8); the CLI defaults to `--accum 16`, averaging
   16 physical-batch gradients before clipping and one Adam/LR update. `--tokens`
@@ -118,6 +131,9 @@ fail loudly if unavailable. The selected backend and device are printed at start
 - `benchmark` performs one unmeasured warmup update and then times synthetic
   full-shape training. It is the preflight tool for choosing a physical batch on
   the exact GPU that will host a run; it never reads data or writes a checkpoint.
+  `forge-98m`, `forge-220m`, and `forge-320m` presets are shared with `train`, so
+  benchmark and production shapes cannot drift. `benchmark-models.sh` runs the
+  reviewed larger-model matrix without starting a training run.
 
 ## Architecture
 
