@@ -112,6 +112,37 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void RepetitionPenalty_DemotesSeenTokensOnce()
+        {
+            float[] logits = { 4f, -2f, 3f, 1f };
+            Sampler.ApplyRepetitionControls(logits, new[] { 0, 1, 0 },
+                repetitionPenalty: 2f, noRepeatNgramSize: 0);
+            Check.Near(logits[0], 2f, 0f, "positive seen logit is divided once");
+            Check.Near(logits[1], -4f, 0f, "negative seen logit is multiplied once");
+            Check.Near(logits[2], 3f, 0f, "unseen logit is unchanged");
+        }
+
+        [Test]
+        public static void NoRepeatNgram_BansOnlyMatchingContinuation()
+        {
+            float[] logits = { 0f, 1f, 2f, 9f, 4f };
+            Sampler.ApplyRepetitionControls(logits, new[] { 1, 2, 3, 1, 2 },
+                repetitionPenalty: 1f, noRepeatNgramSize: 3);
+            Check.True(float.IsNegativeInfinity(logits[3]), "matching 1,2 prefix bans prior continuation 3");
+            Check.Near(logits[4], 4f, 0f, "unrelated continuation remains available");
+        }
+
+        [Test]
+        public static void NoRepeatNgram_RelaxesIfEveryTokenWouldBeBanned()
+        {
+            float[] logits = { 2f, 1f };
+            Sampler.ApplyRepetitionControls(logits, new[] { 0, 1 },
+                repetitionPenalty: 1f, noRepeatNgramSize: 1);
+            Check.Near(logits[0], 2f, 0f, "all-token ban restores first logit");
+            Check.Near(logits[1], 1f, 0f, "all-token ban restores second logit");
+        }
+
+        [Test]
         public static void InvalidSamplingOptionsFailLoudly()
         {
             bool emptyThrew = false;
@@ -123,6 +154,15 @@ namespace LLM.Core.Tests
             try { Sampler.Sample(new[] { 1f }, float.NaN, 0, new Random(1)); }
             catch (ArgumentException) { temperatureThrew = true; }
             Check.True(temperatureThrew, "non-finite temperature throws");
+
+            bool penaltyThrew = false;
+            try
+            {
+                _ = Sampler.Generate(new GptModel(Small, B, new Random(2)), new[] { 1 }, 1,
+                    1f, 0, new Random(1), repetitionPenalty: 0.9f).ToList();
+            }
+            catch (ArgumentOutOfRangeException) { penaltyThrew = true; }
+            Check.True(penaltyThrew, "repetition penalty below one throws");
 
             var model = new GptModel(Small, B, new Random(2));
             bool countThrew = false;

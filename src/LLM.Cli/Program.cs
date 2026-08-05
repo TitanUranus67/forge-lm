@@ -71,9 +71,11 @@ internal static partial class Cli
                         [--vocab 16257] [--ctx 512] [--dmodel 768] [--layers 12] [--heads 12]
           llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
+                        [--repetition-penalty 1.0] [--no-repeat-ngram 0]
                         [--matmul-precision custom|fp32|tf32]
           llm chat      --model <checkpoint> --tokenizer <dir-or-path>
                         [--tokens 100] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
+                        [--repetition-penalty 1.0] [--no-repeat-ngram 0]
                         [--matmul-precision custom|fp32|tf32]
 
         There is no separate train-tokenizer command: tokenizer training is folded
@@ -580,6 +582,8 @@ internal static partial class Cli
                   Loads a checkpoint and tokenizer and samples text autoregressively.
                   --tokenizer may be a tokenizer.json file or the directory holding it.
                   An empty --prompt starts from a single newline token.
+                  --repetition-penalty values above 1 demote tokens already in context.
+                  --no-repeat-ngram N prevents repeating an N-token sequence; 0 disables it.
                 """);
             return 0;
         }
@@ -590,6 +594,8 @@ internal static partial class Cli
         int tokens = p.GetInt("tokens", 200);
         float temperature = p.GetFloat("temperature", 0.8f);
         int topk = p.GetInt("topk", 40);
+        float repetitionPenalty = p.GetFloat("repetition-penalty", 1f);
+        int noRepeatNgram = p.GetInt("no-repeat-ngram", 0);
         int seed = p.GetInt("seed", 1);
         string backendName = p.Get("backend", "auto");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
@@ -615,7 +621,8 @@ internal static partial class Cli
         int count = 0;
         BpeTokenizer.Utf8StreamDecoder decoder = tok.CreateUtf8StreamDecoder();
         foreach (int id in Sampler.Generate(model, promptIds, tokens, temperature, topk, rng,
-                     eosId: tok.EosTokenId))
+                     eosId: tok.EosTokenId, repetitionPenalty: repetitionPenalty,
+                     noRepeatNgramSize: noRepeatNgram))
         {
             Console.Write(decoder.DecodeToken(id));
             count++;
@@ -646,6 +653,8 @@ internal static partial class Cli
 
                   In-chat commands: /reset (clear context), /quit (exit).
                   An empty line just lets the model continue from the current context.
+                  --repetition-penalty values above 1 demote tokens already in context.
+                  --no-repeat-ngram N prevents repeating an N-token sequence; 0 disables it.
                 """);
             return 0;
         }
@@ -655,6 +664,8 @@ internal static partial class Cli
         int tokensPerTurn = p.GetInt("tokens", 100);
         float temperature = p.GetFloat("temperature", 0.8f);
         int topk = p.GetInt("topk", 40);
+        float repetitionPenalty = p.GetFloat("repetition-penalty", 1f);
+        int noRepeatNgram = p.GetInt("no-repeat-ngram", 0);
         int seed = p.GetInt("seed", 1);
         string backendName = p.Get("backend", "auto");
         CudaMatMulMode cudaMatMulMode = ParseCudaMatMulMode(p.Get("matmul-precision", "custom"));
@@ -698,7 +709,8 @@ internal static partial class Cli
             Console.Write("llm> ");
             BpeTokenizer.Utf8StreamDecoder decoder = tok.CreateUtf8StreamDecoder();
             foreach (int id in Sampler.Generate(model, history, tokensPerTurn, temperature, topk, rng,
-                         eosId: tok.EosTokenId))
+                         eosId: tok.EosTokenId, repetitionPenalty: repetitionPenalty,
+                         noRepeatNgramSize: noRepeatNgram))
             {
                 Console.Write(decoder.DecodeToken(id));
                 history.Add(id);

@@ -45,7 +45,8 @@ dotnet run --project src/LLM.Cli -- train --data data/shakes --steps 5000 --out 
 
 # 3. Generate text from the checkpoint
 dotnet run --project src/LLM.Cli -- generate --model out/model.bin --tokenizer data/shakes \
-    --prompt "Once upon a time" --tokens 200 --temperature 0.8 --topk 40
+    --prompt "Once upon a time" --tokens 200 --temperature 0.7 --topk 30 \
+    --repetition-penalty 1.1 --no-repeat-ngram 4
 
 # 4. Or chat with it interactively (base model: it continues your text, it won't answer questions)
 dotnet run --project src/LLM.Cli -- chat --model out/model.bin --tokenizer data/shakes
@@ -106,8 +107,10 @@ fail loudly if unavailable. The selected backend and device are printed at start
   of restarting warmup or repeating data. Saves include a SHA-256 trailer, bind the
   checkpoint to its tokenizer and training data, and rotate the previous generation
   to `<checkpoint>.bak`. Startup hashes the input files before an optimizer update.
-- `generate` loads a checkpoint and samples autoregressively with temperature
-  and top-k filtering. An incremental UTF-8 decoder preserves characters whose
+- `generate` loads a checkpoint and samples autoregressively with temperature,
+  top-k filtering, an opt-in repetition penalty, and an opt-in no-repeat n-gram
+  constraint. The raw defaults leave both repetition controls disabled so model
+  evaluations remain comparable. An incremental UTF-8 decoder preserves characters whose
   bytes span token boundaries. Generation stops when EOS is sampled or when
   the `--tokens` safety limit is reached.
 - `chat` is an interactive REPL over a checkpoint: each line you type is appended

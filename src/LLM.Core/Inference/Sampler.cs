@@ -4,8 +4,8 @@ namespace LLM.Core.Inference
     using LLM.Core.Tensor;
 
     /// <summary>
-    /// Token sampling from a logit vector: temperature scaling, top-k filtering,
-    /// softmax, and categorical sampling — plus an autoregressive
+    /// Token sampling from a logit vector: repetition controls, temperature scaling,
+    /// top-k filtering, softmax, and categorical sampling — plus an autoregressive
     /// <see cref="Generate"/> loop over <see cref="GptModel.ForwardLast"/>.
     /// </summary>
     public static class Sampler
@@ -76,7 +76,8 @@ namespace LLM.Core.Inference
         /// <paramref name="eosId"/> is sampled (the eos token itself is yielded).
         /// </summary>
         public static IEnumerable<int> Generate(GptModel model, IReadOnlyList<int> promptTokens,
-            int maxNewTokens, float temperature, int topK, Random rng, int? eosId = null)
+            int maxNewTokens, float temperature, int topK, Random rng, int? eosId = null,
+            float repetitionPenalty = 1f, int noRepeatNgramSize = 0)
         {
             ArgumentNullException.ThrowIfNull(model);
             ArgumentNullException.ThrowIfNull(promptTokens);
@@ -85,17 +86,92 @@ namespace LLM.Core.Inference
             if (maxNewTokens < 0) throw new ArgumentOutOfRangeException(nameof(maxNewTokens));
             if (eosId is int validatedEos && (uint)validatedEos >= (uint)model.Config.VocabSize)
                 throw new ArgumentOutOfRangeException(nameof(eosId), "EOS token must be inside the model vocabulary.");
+            ValidateRepetitionOptions(repetitionPenalty, noRepeatNgramSize);
             var window = new List<int>(promptTokens);
             for (int n = 0; n < maxNewTokens; n++)
             {
                 if (window.Count > model.Config.ContextLength)
                     window.RemoveRange(0, window.Count - model.Config.ContextLength);
                 Tensor logits = model.ForwardLast(window);
-                int next = Sample(logits.Data, temperature, topK, rng);
+                ReadOnlySpan<float> samplingLogits = logits.Data;
+                float[]? adjusted = null;
+                if (repetitionPenalty != 1f || noRepeatNgramSize > 0)
+                {
+                    adjusted = (float[])logits.Data.Clone();
+                    ApplyRepetitionControls(adjusted, window, repetitionPenalty, noRepeatNgramSize);
+                    samplingLogits = adjusted;
+                }
+                int next = Sample(samplingLogits, temperature, topK, rng);
                 yield return next;
                 window.Add(next);
                 if (eosId is int eos && next == eos) yield break;
             }
+        }
+
+        internal static void ApplyRepetitionControls(Span<float> logits, IReadOnlyList<int> history,
+            float repetitionPenalty, int noRepeatNgramSize)
+        {
+            ValidateRepetitionOptions(repetitionPenalty, noRepeatNgramSize);
+            ArgumentNullException.ThrowIfNull(history);
+
+            if (repetitionPenalty != 1f)
+            {
+                var seen = new HashSet<int>();
+                foreach (int token in history)
+                {
+                    if ((uint)token >= (uint)logits.Length || !seen.Add(token)) continue;
+                    logits[token] = logits[token] < 0f
+                        ? logits[token] * repetitionPenalty
+                        : logits[token] / repetitionPenalty;
+                }
+            }
+
+            if (noRepeatNgramSize <= 0 || history.Count < noRepeatNgramSize - 1) return;
+            float[] beforeBan = logits.ToArray();
+            if (noRepeatNgramSize == 1)
+            {
+                foreach (int token in history)
+                    if ((uint)token < (uint)logits.Length) logits[token] = float.NegativeInfinity;
+            }
+            else
+            {
+                int prefixLength = noRepeatNgramSize - 1;
+                int suffixStart = history.Count - prefixLength;
+                for (int start = 0; start + noRepeatNgramSize <= history.Count; start++)
+                {
+                    bool matches = true;
+                    for (int j = 0; j < prefixLength; j++)
+                    {
+                        if (history[start + j] == history[suffixStart + j]) continue;
+                        matches = false;
+                        break;
+                    }
+                    if (!matches) continue;
+                    int banned = history[start + prefixLength];
+                    if ((uint)banned < (uint)logits.Length)
+                        logits[banned] = float.NegativeInfinity;
+                }
+            }
+
+            bool anyAvailable = false;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                if (float.IsNegativeInfinity(logits[i])) continue;
+                anyAvailable = true;
+                break;
+            }
+            if (!anyAvailable)
+                beforeBan.CopyTo(logits);
+        }
+
+        private static void ValidateRepetitionOptions(float repetitionPenalty, int noRepeatNgramSize)
+        {
+            if (!float.IsFinite(repetitionPenalty) || repetitionPenalty < 1f)
+                throw new ArgumentOutOfRangeException(nameof(repetitionPenalty),
+                    "Repetition penalty must be finite and >= 1.");
+            if (noRepeatNgramSize < 0)
+                throw new ArgumentOutOfRangeException(nameof(noRepeatNgramSize),
+                    "No-repeat n-gram size must be >= 0.");
         }
     }
 }
