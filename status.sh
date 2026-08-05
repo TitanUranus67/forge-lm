@@ -2,12 +2,12 @@
 set -uo pipefail
 
 log_file="${LOG_FILE:-out/forge.log}"
-checkpoint="${MODEL:-out/forge-98m.bin}"
+checkpoint="${MODEL:-out/forge-220m.bin}"
 tokens_per_update="${TOKENS_PER_UPDATE:-32768}"
-hourly_rate="${HOURLY_RATE:-0.44977777777777783}"
+hourly_rate="${HOURLY_RATE:-0.4311111111111111}"
 display_timezone="${DISPLAY_TZ:-PST8PDT}"
 
-if [[ -t 1 ]]; then
+if [[ -t 1 || "${FORCE_COLOR:-0}" == "1" ]]; then
     bold=$'\033[1m'
     dim=$'\033[2m'
     green=$'\033[32m'
