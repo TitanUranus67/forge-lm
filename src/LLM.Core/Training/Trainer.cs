@@ -134,6 +134,7 @@ namespace LLM.Core.Training
                 model.Params.ZeroGrads();
                 long p1 = prof ? Stopwatch.GetTimestamp() : 0;
                 model.Backend.BeginLossAccumulation();
+                float microbatchGradientScale = 1f / accumulation;
                 for (int microStep = 0; microStep < accumulation; microStep++)
                 {
                     for (int b = 0; b < batch; b++)
@@ -142,11 +143,9 @@ namespace LLM.Core.Training
                         Array.Copy(seqInputs, 0, inputs, b * ctx, ctx);
                         Array.Copy(seqTargets, 0, targets, b * ctx, ctx);
                     }
-                    model.ForwardBackward(inputs, targets, batch);
+                    model.ForwardBackward(inputs, targets, batch, microbatchGradientScale);
                 }
                 lastTrain = model.Backend.EndLossAccumulation();
-                if (accumulation > 1)
-                    ScaleGradients(model.Params, model.Backend, 1f / accumulation);
                 long p2 = prof ? Stopwatch.GetTimestamp() : 0;
                 ClipGradNorm(model.Params, model.Backend, opts.GradClip);
                 long p3 = prof ? Stopwatch.GetTimestamp() : 0;
@@ -214,20 +213,50 @@ namespace LLM.Core.Training
         internal static void ClipGradNorm(Parameters p, ITensorBackend backend, float maxNorm)
         {
             if (maxNorm <= 0f) return;
-            double sumSq = backend.GlobalSumSquares(p.Gradients);
-            float norm = MathF.Sqrt((float)sumSq);
-            if (!float.IsFinite(norm))
-                throw new InvalidOperationException("Global gradient norm is non-finite.");
+            double norm = Math.Sqrt(backend.GlobalSumSquares(p.Gradients));
+            if (!double.IsFinite(norm))
+                norm = RobustGradientNorm(p, backend);
             if (norm <= maxNorm || norm == 0f) return;
-            float scale = maxNorm / norm;
+            float scale = (float)(maxNorm / norm);
             foreach (string name in p.Names)
                 backend.Scale(p.Grad(name), scale);
         }
 
-        private static void ScaleGradients(Parameters p, ITensorBackend backend, float scale)
+        /// <summary>
+        /// Overflow-resistant scaled L2 norm used only when the backend's fast
+        /// sum-of-squares reduction is non-finite. The fallback also identifies the
+        /// first genuinely non-finite gradient instead of reporting only a global norm.
+        /// </summary>
+        internal static double RobustGradientNorm(Parameters p, ITensorBackend backend)
         {
+            double scale = 0d;
+            double scaledSumSquares = 1d;
             foreach (string name in p.Names)
-                backend.Scale(p.Grad(name), scale);
+            {
+                Tensor gradient = p.Grad(name);
+                backend.EnsureHostCurrent(gradient);
+                for (int i = 0; i < gradient.Length; i++)
+                {
+                    float value = gradient.Data[i];
+                    if (!float.IsFinite(value))
+                        throw new InvalidOperationException(
+                            $"Non-finite gradient at '{name}'[{i}] = {value:R}.");
+                    double magnitude = Math.Abs((double)value);
+                    if (magnitude == 0d) continue;
+                    if (scale < magnitude)
+                    {
+                        double ratio = scale / magnitude;
+                        scaledSumSquares = 1d + scaledSumSquares * ratio * ratio;
+                        scale = magnitude;
+                    }
+                    else
+                    {
+                        double ratio = magnitude / scale;
+                        scaledSumSquares += ratio * ratio;
+                    }
+                }
+            }
+            return scale == 0d ? 0d : scale * Math.Sqrt(scaledSumSquares);
         }
     }
 }

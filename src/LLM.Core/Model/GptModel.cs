@@ -123,14 +123,18 @@ namespace LLM.Core.Model
         /// <summary>
         /// Full training step on one (inputs, targets) pair: forward, mean cross-entropy
         /// (ignoreIndex = -1), backward accumulating every parameter gradient.
+        /// <paramref name="gradientScale"/> scales dLogits before it enters the
+        /// backward graph without changing the reported loss.
         /// Gradients are NOT zeroed here — call <see cref="Parameters.ZeroGrads"/> first.
         /// Returns the loss.
         /// </summary>
-        public float ForwardBackward(IReadOnlyList<int> inputs, IReadOnlyList<int> targets)
+        public float ForwardBackward(IReadOnlyList<int> inputs, IReadOnlyList<int> targets,
+            float gradientScale = 1f)
         {
             if (inputs.Count != targets.Count)
                 throw new ArgumentException($"inputs ({inputs.Count}) and targets ({targets.Count}) must have equal length.");
-            return ForwardBackwardCore(ValidateTokens(inputs), ValidateTargets(targets), batch: 1);
+            ValidateGradientScale(gradientScale);
+            return ForwardBackwardCore(ValidateTokens(inputs), ValidateTargets(targets), batch: 1, gradientScale);
         }
 
         /// <summary>
@@ -140,13 +144,16 @@ namespace LLM.Core.Model
         /// (T = inputs.Length / batch). One forward/backward over [B*T, C] tensors;
         /// the loss and gradients are the mean over all B*T positions (which, all
         /// sequences having equal length, equals the mean of per-sequence means).
+        /// <paramref name="gradientScale"/> scales dLogits before it enters the
+        /// backward graph without changing the reported loss.
         /// Gradients are NOT zeroed here — call <see cref="Parameters.ZeroGrads"/> first.
         /// Returns the loss.
         /// </summary>
-        public float ForwardBackward(int[] inputs, int[] targets, int batch)
+        public float ForwardBackward(int[] inputs, int[] targets, int batch, float gradientScale = 1f)
         {
             ValidateBatch(inputs, targets, batch);
-            return ForwardBackwardCore(ValidateTokenIds(inputs), ValidateTargets(targets), batch);
+            ValidateGradientScale(gradientScale);
+            return ForwardBackwardCore(ValidateTokenIds(inputs), ValidateTargets(targets), batch, gradientScale);
         }
 
         /// <summary>
@@ -206,7 +213,7 @@ namespace LLM.Core.Model
         }
 
         /// <summary>Batched training step: forward, mean cross-entropy over all B*T positions, backward.</summary>
-        private float ForwardBackwardCore(int[] inputs, int[] targets, int batch)
+        private float ForwardBackwardCore(int[] inputs, int[] targets, int batch, float gradientScale)
         {
             Tensor logits = ForwardCore(inputs, batch);
             int rows = logits.Shape[0], v = Config.VocabSize;
@@ -220,8 +227,17 @@ namespace LLM.Core.Model
             float loss = _b.CrossEntropyForward(logits, targets, probs, rows, v, IgnoreIndex);
             Tensor dLogits = logits;
             _b.CrossEntropyBackward(probs, targets, dLogits, rows, v, IgnoreIndex);
+            if (gradientScale != 1f)
+                _b.Scale(dLogits, gradientScale);
             Backward(dLogits);
             return loss;
+        }
+
+        private static void ValidateGradientScale(float gradientScale)
+        {
+            if (!float.IsFinite(gradientScale) || gradientScale <= 0f)
+                throw new ArgumentOutOfRangeException(nameof(gradientScale),
+                    "Gradient scale must be finite and > 0.");
         }
 
         /// <summary>Positional indices [0..T) repeated B times; rebuilt only when (B, T) changes.</summary>

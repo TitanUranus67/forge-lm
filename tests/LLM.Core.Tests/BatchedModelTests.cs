@@ -148,6 +148,28 @@ namespace LLM.Core.Tests
         }
 
         [Test]
+        public static void GradientScale_ScalesGradientsWithoutChangingLoss()
+        {
+            var full = new GptModel(Small, B, new Random(22));
+            var scaled = new GptModel(Small, B, new Random(22));
+            var (inputs, targets) = MakeBatch(batch: 2, ctx: Small.ContextLength,
+                vocab: Small.VocabSize, seed: 101);
+
+            full.Params.ZeroGrads();
+            float fullLoss = full.ForwardBackward(inputs, targets, batch: 2);
+            scaled.Params.ZeroGrads();
+            float scaledLoss = scaled.ForwardBackward(inputs, targets, batch: 2, gradientScale: 0.25f);
+
+            Check.Near(scaledLoss, fullLoss, 0f, "gradient scaling does not change reported loss");
+            foreach (string name in full.Params.Names)
+            {
+                float[] expected = full.Params.Grad(name).Data.Select(x => x * 0.25f).ToArray();
+                Check.SpanNear(scaled.Params.Grad(name).Data, expected, 2e-6f,
+                    $"gradient scaling applies before backward: {name}");
+            }
+        }
+
+        [Test]
         public static void Trainer_BatchedTrainLossDrops()
         {
             // Repetitive data: next token is fully predictable (i -> (i+1) mod 16).

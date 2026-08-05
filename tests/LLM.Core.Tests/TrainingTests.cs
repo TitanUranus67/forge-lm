@@ -16,6 +16,11 @@ namespace LLM.Core.Tests
     {
         private static readonly CpuBackend B = new();
 
+        private sealed class OverflowingNormBackend : CpuBackend
+        {
+            public double GlobalSumSquares(IReadOnlyList<Tensor> tensors) => double.PositiveInfinity;
+        }
+
         private static ModelConfig Small => new(VocabSize: 32, ContextLength: 8, DModel: 16, NLayers: 2, NHeads: 2);
 
         [Test]
@@ -99,9 +104,43 @@ namespace LLM.Core.Tests
             }
             catch (InvalidOperationException ex)
             {
-                threw = ex.Message.Contains("non-finite", StringComparison.OrdinalIgnoreCase);
+                threw = ex.Message.Contains("'w'[0]", StringComparison.Ordinal) &&
+                    ex.Message.Contains("NaN", StringComparison.Ordinal);
             }
-            Check.True(threw, "non-finite global gradient norm fails loudly");
+            Check.True(threw, "non-finite gradient reports the exact tensor and element");
+        }
+
+        [Test]
+        public static void RobustGradientNorm_HandlesValuesWhoseSquaresOverflowFloat()
+        {
+            var p = new Parameters();
+            p.Add("huge", 2);
+            p.Grad("huge").Data[0] = float.MaxValue;
+            p.Grad("huge").Data[1] = -float.MaxValue;
+
+            double norm = Trainer.RobustGradientNorm(p, B);
+            double expected = Math.Sqrt(2d) * float.MaxValue;
+            Check.True(double.IsFinite(norm), "robust gradient norm remains finite");
+            Check.True(Math.Abs(norm - expected) / expected < 1e-12,
+                $"robust norm {norm:G6} matches scaled reference {expected:G6}");
+        }
+
+        [Test]
+        public static void ClipGradNorm_FallsBackWhenFastReductionOverflows()
+        {
+            var backend = new OverflowingNormBackend();
+            var p = new Parameters(backend);
+            p.Add("a", 1);
+            p.Add("b", 1);
+            p.Grad("a").Data[0] = 3f;
+            p.Grad("b").Data[0] = 4f;
+
+            Trainer.ClipGradNorm(p, backend, 1f);
+
+            Check.Near(p.Grad("a").Data[0], 0.6f, 1e-6f,
+                "overflowing fast norm falls back and clips gradient a");
+            Check.Near(p.Grad("b").Data[0], 0.8f, 1e-6f,
+                "overflowing fast norm falls back and clips gradient b");
         }
 
         [Test]
