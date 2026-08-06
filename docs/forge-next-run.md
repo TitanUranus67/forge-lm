@@ -20,17 +20,20 @@ activation footprint forces an inefficient microbatch.
 
 ## Benchmark gate
 
-Publish the current Release build to the candidate GPU, then run:
+Publish the current Release build to the candidate GPU, then benchmark each
+preset and geometry directly. For example:
 
 ```bash
-chmod +x benchmark-models.sh
-APP=./app/LLM.Cli STEPS=3 ./benchmark-models.sh
+./app/forge benchmark --backend cuda --preset forge-220m \
+  --matmul-precision custom --batch 1 --accum 32 --steps 3
+
+./app/forge benchmark --backend cuda --preset forge-320m \
+  --matmul-precision custom --batch 1 --accum 32 --steps 3
 ```
 
-The script tests both larger presets, custom and cuBLAS FP32 matmuls, and batch/accum
-geometries that all retain 32,768 tokens per optimizer update. OOM cases are recorded
-instead of ending the matrix. Use at least three measured updates after the warmup;
-raise `STEPS` to 5 if results are close.
+Repeat with `--matmul-precision fp32` and every batch/accumulation geometry that
+retains 32,768 tokens per optimizer update. Use at least three measured updates
+after the warmup; raise `--steps` to 5 if results are close.
 
 For every surviving row record:
 
@@ -52,17 +55,17 @@ Example preparation sequence (adjust shard counts only after checking available 
 counts against the requested shares):
 
 ```bash
-./app/LLM.Cli prepare-fineweb \
+./app/forge prepare-fineweb \
   --out data/forge-next/fineweb-edu --dataset fineweb-edu \
   --shards 10 --merges 16000 --encode-workers 8
 
-./app/LLM.Cli prepare-fineweb \
+./app/forge prepare-fineweb \
   --out data/forge-next/fineweb --dataset fineweb \
   --shards 3 --tokenizer data/forge-next/fineweb-edu/tokenizer.json \
   --exclude-index data/forge-next/fineweb-edu/corpus.idx \
   --encode-workers 8
 
-./app/LLM.Cli prepare-mixture \
+./app/forge prepare-mixture \
   --manifest docs/forge-next-mixture.example.json \
   --out data/forge-next/mixed
 ```
@@ -88,7 +91,7 @@ folded into this first mixture.
 1. Run the complete CPU, CUDA, and D3D12 test suite where those devices are available.
 2. Verify mixture manifests and record tokenizer/train/validation SHA-256 identities.
 3. Run a short fresh-model smoke test through warmup, validation, save, and exact resume.
-4. Generate with raw decoding controls disabled for comparable evaluation, then use the
-   sample scripts' repetition controls for a separate user-facing quality check.
+4. Generate a fixed prompt-and-seed evaluation with raw decoding controls disabled,
+   then repeat with documented repetition controls for a separate user-facing check.
 5. Review the benchmark table and approve the model, GPU, token budget, projected time,
    and projected cost before launching the full run.

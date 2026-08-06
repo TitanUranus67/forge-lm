@@ -45,7 +45,7 @@ temporarily coexist with the current checkpoint and its `.bak` generation.
 
 ```sh
 nvidia-smi
-chmod +x publish/linux-x64/LLM.Cli
+chmod +x publish/linux-x64/forge
 ```
 
 The process must see an NVIDIA driver (`libcuda.so`). On a container host, start
@@ -55,7 +55,7 @@ one selected GPU; the backend opens visible device zero.
 Run the production-shape benchmark before committing to a physical batch:
 
 ```sh
-./publish/linux-x64/LLM.Cli benchmark \
+./publish/linux-x64/forge benchmark \
   --backend cuda \
   --batch 4 --accum 16 --steps 3
 ```
@@ -67,14 +67,14 @@ Repeat with `--batch 8 --accum 8` and, when VRAM headroom permits,
 ## 4. Start Forge-98M from scratch
 
 ```sh
-./publish/linux-x64/LLM.Cli train \
+./publish/linux-x64/forge train \
   --backend cuda \
   --preset forge-98m \
   --data data/forge \
   --tokens 1024000000 \
   --warmup-tokens 4096000 \
-  --lr 6e-4 \
-  --minlr 6e-5 \
+  --lr 3e-4 \
+  --minlr 3e-5 \
   --batch 4 \
   --accum 16 \
   --logevery 16 \

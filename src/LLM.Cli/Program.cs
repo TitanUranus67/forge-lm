@@ -12,7 +12,7 @@ using LLM.Core.Tensor.Gpu;
 using LLM.Core.Tokenizer;
 using LLM.Core.Training;
 
-// LLM.Cli — Forge command line: prepare / train / generate.
+// ForgeLM command line: prepare / train / generate.
 // (train-tokenizer is folded into `prepare`.)
 
 if (args.Length == 0 || args[0] is "--help" or "-h" or "help")
@@ -54,19 +54,19 @@ internal static partial class Cli
     }
 
     internal static void PrintUsage() => Console.WriteLine("""
-        LLM.Cli — Forge from scratch in C#
+        ForgeLM — language-model training and inference from scratch in C#
 
         Usage:
-          llm prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
-          llm prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb] [--shards 10]
+          forge prepare   [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
+          forge prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb] [--shards 10]
                               [--merges 16000] [--toktrainmb 200] [--tokenizer <path>]
                               [--exclude-index <corpus.idx>]
                               [--rebuild true]
-          llm prepare-mixture --manifest <mixture.json> --out <dir> [--rebuild true]
-          llm train     --data <dir> [--preset forge-98m|forge-220m|forge-320m]
+          forge prepare-mixture --manifest <mixture.json> --out <dir> [--rebuild true]
+          forge train     --data <dir> [--preset forge-98m|forge-220m|forge-320m]
                         [--steps 5000 | --tokens N | --epochs 1]
                         [--name Forge-98M] [--dmodel 128] [--layers 4] [--heads 4]
-                        [--ctx 128] [--batch 8] [--accum 16] [--lr 6e-4] [--minlr 6e-5]
+                        [--ctx 128] [--batch 8] [--accum 16] [--lr 3e-4] [--minlr 3e-5]
                         [--warmup 100 | --warmup-tokens N] [--wd 0.1]
                         [--gradclip 1.0] [--seed 42] [--logevery 10] [--valevery 250]
                         [--valbatches 50] [--valseed 424242]
@@ -75,16 +75,16 @@ internal static partial class Cli
                         [--matmul-precision custom|fp32|tf32]
                         [--cache-attention false]
                         [--cuda-graphs false]
-          llm benchmark [--preset forge-98m|forge-220m|forge-320m]
+          forge benchmark [--preset forge-98m|forge-220m|forge-320m]
                         [--backend cuda] [--batch N] [--accum N] [--steps 3]
                         [--vocab 16257] [--ctx N] [--dmodel N] [--layers N] [--heads N]
                         [--cache-attention false]
                         [--cuda-graphs false]
-          llm generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
+          forge generate  --model <checkpoint> --tokenizer <dir-or-path> [--prompt "Once upon a time"]
                         [--tokens 200] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
                         [--repetition-penalty 1.0] [--no-repeat-ngram 0]
                         [--matmul-precision custom|fp32|tf32]
-          llm chat      --model <checkpoint> --tokenizer <dir-or-path>
+          forge chat      --model <checkpoint> --tokenizer <dir-or-path>
                         [--tokens 100] [--temperature 0.8] [--topk 40] [--seed 1] [--backend auto|cpu|gpu|cuda]
                         [--repetition-penalty 1.0] [--no-repeat-ngram 0]
                         [--matmul-precision custom|fp32|tf32]
@@ -163,7 +163,7 @@ internal static partial class Cli
         if (p.Help)
         {
             Console.WriteLine("""
-                llm prepare [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
+                forge prepare [--corpus <path-or-url>] --out <dir> [--merges 2000] [--tokenizer <path>]
 
                   Downloads the corpus when --corpus is an http(s) URL (default:
                   tiny-shakespeare), trains (or loads) a byte-level BPE tokenizer,
@@ -276,7 +276,7 @@ internal static partial class Cli
         if (p.Help)
         {
             Console.WriteLine("""
-                llm benchmark [options]
+                forge benchmark [options]
 
                   Runs one unmeasured warmup optimizer update followed by a short,
                   synthetic GPT training benchmark. No dataset or checkpoint is read
@@ -370,7 +370,7 @@ internal static partial class Cli
         if (p.Help)
         {
             Console.WriteLine("""
-                llm train --data <dir> [options]
+                forge train --data <dir> [options]
 
                   Trains Forge on tokenizer.json + train.bin/val.bin produced by
                   `prepare`. Reviewed presets are forge-98m (768/12/12/512),
@@ -495,8 +495,8 @@ internal static partial class Cli
             : epochTokenBudget is long epochTokens
                 ? UpdatesForTokens(epochTokens, tokensPerUpdate, "--epochs")
             : stepsArg ?? stored?.TotalSteps ?? 5000;
-        float lr = lrArg ?? stored?.MaxLr ?? 6e-4f;
-        float minlr = minlrArg ?? stored?.MinLr ?? 6e-5f;
+        float lr = lrArg ?? stored?.MaxLr ?? 3e-4f;
+        float minlr = minlrArg ?? stored?.MinLr ?? 3e-5f;
         int warmup = warmupTokensArg is long warmupTokenBudget
             ? UpdatesForTokens(warmupTokenBudget, tokensPerUpdate, "--warmup-tokens")
             : warmupArg ?? stored?.WarmupSteps ?? 100;
@@ -625,7 +625,7 @@ internal static partial class Cli
         if (p.Help)
         {
             Console.WriteLine("""
-                llm generate --model <checkpoint> --tokenizer <dir-or-path> [options]
+                forge generate --model <checkpoint> --tokenizer <dir-or-path> [options]
 
                   Loads a checkpoint and tokenizer and samples text autoregressively.
                   --tokenizer may be a tokenizer.json file or the directory holding it.
@@ -692,7 +692,7 @@ internal static partial class Cli
         if (p.Help)
         {
             Console.WriteLine("""
-                llm chat --model <checkpoint> --tokenizer <dir-or-path> [options]
+                forge chat --model <checkpoint> --tokenizer <dir-or-path> [options]
 
                   Interactive REPL over a checkpoint: each line you type is appended to
                   the rolling context and the model continues it. This is a base
@@ -754,7 +754,7 @@ internal static partial class Cli
             if (history.Count > keep)
                 history.RemoveRange(0, history.Count - keep);
 
-            Console.Write("llm> ");
+            Console.Write("forge> ");
             BpeTokenizer.Utf8StreamDecoder decoder = tok.CreateUtf8StreamDecoder();
             foreach (int id in Sampler.Generate(model, history, tokensPerTurn, temperature, topk, rng,
                          eosId: tok.EosTokenId, repetitionPenalty: repetitionPenalty,

@@ -5,4 +5,5 @@ data/*
 data/forge/*
 !data/forge/SOURCE.md
 out/
+publish/
 .secrets/

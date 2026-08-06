@@ -23,7 +23,7 @@ internal static partial class Cli
         if (p.Help)
         {
             Console.WriteLine("""
-                llm prepare-mixture --manifest <mixture.json> --out <dir> [--rebuild true]
+                forge prepare-mixture --manifest <mixture.json> --out <dir> [--rebuild true]
 
                   Builds one deterministic train/validation dataset from two or more
                   prepared source directories. All sources must use byte-identical

@@ -40,7 +40,7 @@ internal static partial class Cli
         if (p.Help)
         {
             Console.WriteLine("""
-                llm prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb]
+                forge prepare-fineweb --out <dir> [--dataset fineweb-edu|fineweb]
                     [--shards 10] [--merges 16000] [--toktrainmb 200]
                     [--encode-workers <up-to-8>] [--tokenizer <path>]
                     [--exclude-index <corpus.idx>] [--rebuild true]

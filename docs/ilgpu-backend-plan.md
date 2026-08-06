@@ -10,7 +10,7 @@ always falling back to D3D12 or CPU when CUDA is unavailable.
 
 ## Key facts (verified)
 - **ILGPU 1.5.3** and **ILGPU.Algorithms 1.5.3** target .NET Standard 2.1 / .NET 5+
-  and work on net9.0. Algorithms is required to register CUDA implementations for
+  and work on net10.0. Algorithms is required to register CUDA implementations for
   `Exp`, `Log`, `Sqrt`, and `Tanh`; the first runtime compilation proved that the
   original one-package assumption was incorrect. Reductions remain project-owned.
 - NuGet restore on this machine needs `--source https://api.nuget.org/v3/index.json`

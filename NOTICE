@@ -1,0 +1,10 @@
+ForgeLM
+Copyright 2026 Daniel Lund
+
+Forge-98M was trained on FineWeb-Edu, published by Hugging Face under the
+Open Data Commons Attribution License (ODC-By) v1.0 and derived from Common
+Crawl data.
+
+FineWeb-Edu: https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
+ODC-By 1.0: https://opendatacommons.org/licenses/by/1-0/
+Common Crawl terms: https://commoncrawl.org/terms-of-use

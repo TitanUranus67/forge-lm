@@ -1,17 +1,33 @@
-# Forge
+# ForgeLM
 
-Forge is a compact language model built from scratch in C# (.NET 9). Everything (BPE tokenizer,
-transformer, AdamW, SIMD tensor backend, checkpoint format) is implemented in
-C#. [ComputeSharp](https://github.com/Sergio0694/ComputeSharp) powers the
-optional Windows D3D12 backend; [ILGPU](https://github.com/m4rs-mt/ILGPU)
-powers the NVIDIA CUDA backend on Linux and Windows. The CLI additionally uses
-[Parquet.Net](https://github.com/aloneguid/parquet-dotnet) to read FineWeb
-parquet shards for `prepare-fineweb`.
+[![CI](https://github.com/TitanUranus67/forge-lm/actions/workflows/ci.yml/badge.svg)](https://github.com/TitanUranus67/forge-lm/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+ForgeLM is a from-scratch GPT-style language model implementation in C# and
+.NET 10. The repository includes a byte-level BPE tokenizer, transformer,
+AdamW optimizer, deterministic data preparation, resumable checkpoints, text
+generation, and custom CPU, NVIDIA CUDA, and Windows Direct3D 12 backends.
+
+[ComputeSharp](https://github.com/Sergio0694/ComputeSharp) powers the optional
+Windows D3D12 backend, [ILGPU](https://github.com/m4rs-mt/ILGPU) powers CUDA on
+Linux and Windows, and
+[Parquet.Net](https://github.com/aloneguid/parquet-dotnet) reads FineWeb parquet
+shards during data preparation.
+
+## Forge-98M
+
+The first released model is **Forge-98M**, a 97,934,592-parameter base language
+model trained on 1.024 billion FineWeb-Edu tokens. It is an experimental text
+completion model, not an instruction-following assistant.
+
+- [Download the checkpoint and tokenizer](https://github.com/TitanUranus67/forge-lm/releases/latest)
+- [Read the model card](MODEL_CARD.md)
+- Checkpoint SHA-256: `563a112a7b8ab61e95e5ffe47968896362d59831532d7369ed008be015828481`
 
 ## Build & test
 
 ```sh
-dotnet build
+dotnet build ForgeLM.slnx
 dotnet run --project tests/LLM.Core.Tests   # CUDA/D3D12 tests skip cleanly when unavailable
 ```
 
@@ -35,7 +51,7 @@ dotnet run --project src/LLM.Cli -- prepare-mixture \
 # and override batch/accum/matmul with its winning configuration
 dotnet run -c Release --project src/LLM.Cli -- train --preset forge-98m \
     --backend cuda --data data/forge --tokens 1024000000 --warmup-tokens 4096000 \
-    --lr 6e-4 --minlr 6e-5 --logevery 16 --valevery 320 --valbatches 50 \
+    --lr 3e-4 --minlr 3e-5 --logevery 16 --valevery 320 --valbatches 50 \
     --saveevery 320
 
 # 2. Train a small GPT (checkpoint written to out/model.bin)
@@ -132,8 +148,8 @@ fail loudly if unavailable. The selected backend and device are printed at start
   full-shape training. It is the preflight tool for choosing a physical batch on
   the exact GPU that will host a run; it never reads data or writes a checkpoint.
   `forge-98m`, `forge-220m`, and `forge-320m` presets are shared with `train`, so
-  benchmark and production shapes cannot drift. `benchmark-models.sh` runs the
-  reviewed larger-model matrix without starting a training run.
+  benchmark and production shapes cannot drift. See the
+  [next-run plan](docs/forge-next-run.md) for the reviewed larger-model matrix.
 
 ## Architecture
 
@@ -195,11 +211,8 @@ fail loudly if unavailable. The selected backend and device are printed at start
 - `--backend gpu` requires Windows with a D3D12 device (any recent NVIDIA/AMD/Intel driver;
   WARP software devices also work for correctness testing). Without one, the
   GPU tests skip and `--backend gpu` exits with a clear error.
-- Runtime: the ComputeSharp source generators rely on `[UnsafeAccessor]`,
-  which hits a JIT bug in .NET 9.0.0–9.0.2 (`MissingFieldException` on
-  dispatch). The app and test projects set `RollForward=LatestMajor`, so any
-  newer runtime (.NET 9.0.3+ servicing or .NET 10) is used automatically when
-  installed. The CPU backend is unaffected on any runtime.
+- ForgeLM targets .NET 10. Use the SDK version selected by `global.json` or a
+  newer compatible .NET 10 feature band.
 - Reference throughput on an RTX 2080 8 GB, Forge-98M scale
   (`--dmodel 768 --layers 12 --heads 12 --ctx 512 --batch 8`, 4096 tokens/step):
   CPU ≈ 100 tok/s, GPU ≈ 950 tok/s (~9×). Device memory usage is ~5.5 GB.
@@ -211,6 +224,17 @@ fail loudly if unavailable. The selected backend and device are printed at start
 
 For a self-contained Linux publish and cloud resume checklist, see
 [docs/linux-cuda.md](docs/linux-cuda.md).
+
+## Data and licensing
+
+ForgeLM source code and the released Forge-98M weights are licensed under
+[Apache-2.0](LICENSE). Forge-98M was trained on
+[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu), which
+is distributed under ODC-By 1.0 and derived from Common Crawl. Exact source
+shards, preparation settings, and artifact hashes are recorded in
+[data/forge/SOURCE.md](data/forge/SOURCE.md). Users remain responsible for
+reviewing generated output and complying with applicable dataset and content
+terms.
 
 ## Project layout
 
