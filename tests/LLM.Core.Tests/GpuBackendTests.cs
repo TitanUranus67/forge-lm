@@ -31,6 +31,8 @@ namespace LLM.Core.Tests
                 if (!_probed)
                 {
                     _probed = true;
+                    if (Environment.GetEnvironmentVariable("FORGELM_SKIP_D3D12_TESTS") == "1")
+                        return null;
                     try
                     {
                         if (GpuBackend.IsAvailable) _gpu = new GpuBackend();

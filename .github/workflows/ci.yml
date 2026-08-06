@@ -33,3 +33,8 @@ jobs:
 
       - name: Test
         run: dotnet run --project tests/LLM.Core.Tests --configuration Release --no-build
+        # Hosted Windows runners expose a software D3D12 adapter whose shader
+        # transcendental behavior is not representative of supported hardware.
+        # D3D12 is exercised on real GPUs in the local pre-release test matrix.
+        env:
+          FORGELM_SKIP_D3D12_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '0' }}
